@@ -24,8 +24,8 @@ async fn main() -> Result<()> {
 
     let bot = AIChatSession::new()
         .set_api(
-            apis::apis::QWEN_LLM.url,
-            apis::apis::QWEN_LLM.key
+            apis::QWEN_LLM.url,
+            apis::QWEN_LLM.key
         )
         .load_sense(senses.militech_acs).await?
         .set_model("qwen3.5-plus")

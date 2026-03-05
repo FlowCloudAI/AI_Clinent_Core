@@ -38,8 +38,8 @@ async fn main() -> Result<()> {
     // ====== Bot A ======
     let bot_a = AIChatSession::new()
         .set_api(
-            apis::apis::QWEN_LLM.url,
-            apis::apis::QWEN_LLM.key
+            apis::QWEN_LLM.url,
+            apis::QWEN_LLM.key
         )
         .load_sense(senses.llm_b)
         .await?
@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
     // ====== Bot B ======
     let bot_b = AIChatSession::new()
         .set_api(
-            apis::apis::QWEN_LLM.url,
-            apis::apis::QWEN_LLM.key
+            apis::QWEN_LLM.url,
+            apis::QWEN_LLM.key
         )
         .load_sense(senses.llm_a)
         .await?
