@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 use wasmtime::component::ResourceTable;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 

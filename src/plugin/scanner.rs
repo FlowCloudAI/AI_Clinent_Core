@@ -1,9 +1,9 @@
-use crate::types::{PluginInfo, PluginMeta};
 use std::fs;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 use anyhow::Result;
+use crate::plugin::types::{PluginInfo, PluginMeta};
 
 pub struct PluginScanner;
 

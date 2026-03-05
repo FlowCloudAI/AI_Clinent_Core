@@ -1,5 +1,5 @@
 use anyhow::Result;
-use flowcloudai_client_core::PluginManager;
+use flowcloudai_client::PluginManager;
 use std::path::PathBuf;
 
 fn main() -> Result<()> {

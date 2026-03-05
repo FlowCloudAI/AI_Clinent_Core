@@ -5,10 +5,8 @@ use std::path::{Path, PathBuf};
 use wasmtime::component::Linker;
 use wasmtime::{Config, Engine};
 
-use crate::loaded::LoadedPlugin;
-use crate::scanner::PluginScanner;
-use crate::types::{HostState, PluginKind, PluginMeta};
-use crate::SUPPORTED_ABI_VERSION;
+use crate::{LoadedPlugin, PluginScanner, SUPPORTED_ABI_VERSION};
+use crate::plugin::types::{HostState, PluginKind, PluginMeta};
 
 pub struct PluginManager {
     plug_path: PathBuf,

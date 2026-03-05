@@ -1,4 +1,3 @@
-use crate::types::{plugin_bindings, HostState, PluginKind, PluginMeta};
 use anyhow::anyhow;
 use std::collections::HashMap;
 use std::fs::File;
@@ -7,6 +6,7 @@ use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::WasiCtxBuilder;
 use zip::ZipArchive;
+use crate::plugin::types::{plugin_bindings, HostState, PluginKind, PluginMeta};
 
 pub struct LoadedPlugin {
     pub kind: PluginKind,

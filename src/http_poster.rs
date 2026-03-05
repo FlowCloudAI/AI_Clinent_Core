@@ -1,0 +1,53 @@
+use anyhow::{Result, anyhow};
+use futures_util::{StreamExt, TryStreamExt};
+use reqwest::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use serde_json::Value;
+use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::io::StreamReader;
+
+pub struct HttpPoster {
+    client: Client,
+}
+
+impl HttpPoster {
+    pub fn new() -> Self {
+        Self {
+            client: Client::new(),
+        }
+    }
+
+    pub async fn post_json(
+        &self,
+        url: String,
+        key: String,
+        body: Value,
+    ) -> Result<impl futures_util::Stream<Item = Result<String>>> {
+        let req = self
+            .client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json")
+            .header(AUTHORIZATION, format!("Bearer {}", key));
+
+        let res = req.json(&body).send().await?;
+
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(anyhow!("HTTP 错误 {}: {}", status, text));
+        }
+
+        // bytes_stream -> AsyncRead
+        let byte_stream = res
+            .bytes_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let reader = StreamReader::new(byte_stream);
+
+        // 按行解码（不再 join 再 split）
+        let lines = FramedRead::new(reader, LinesCodec::new())
+            .map(|line| line.map_err(|e| anyhow!(e)).map(|s| s));
+
+        Ok(lines)
+    }
+}
