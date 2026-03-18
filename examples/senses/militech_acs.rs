@@ -2,11 +2,14 @@
 // 不代表生产环境中的推荐架构或最佳实践。
 
 use anyhow::Context;
-use flowcloudai_client::llm::sense::{SenseLoader, SenseState, sense_state_new};
-use flowcloudai_client::llm::tool::{ToolFunctions, arg_i32, arg_str};
-use flowcloudai_client::llm::types::{ChatRequest, ThinkingType, ToolFunctionArg};
 use serde_json::Value;
-use std::io::{Write, stdin, stdout};
+use std::io::{stdin, stdout, Write};
+
+use flowcloudai_client::llm::sense::{sense_state_new, SenseLoader, SenseState};
+use flowcloudai_client::llm::tool::{arg_i32, arg_str, ToolFunctions};
+use flowcloudai_client::llm::types::{ChatRequest, ThinkingType, ToolFunctionArg};
+use flowcloudai_client::sense::Sense;
+use flowcloudai_client::tool::registry::ToolRegistry;
 
 #[allow(dead_code)]
 pub struct ACSSense {
@@ -111,19 +114,169 @@ Now begin the conversation.".to_string(),
     }
 }
 
-impl SenseLoader for ACSSense {
-    fn get_prompt(&self) -> Option<Vec<String>> {
-        Some(vec![self.prompt.clone()])
+impl Sense for ACSSense {
+    fn prompts(&self) -> Vec<String> {
+        vec![self.prompt.clone()]
     }
 
-    fn get_request(&self) -> Option<ChatRequest> {
+    fn default_request(&self) -> Option<ChatRequest> {
         Some(self.config.clone())
     }
 
-    fn install_tool(&self, tf: &mut ToolFunctions) -> anyhow::Result<String> {
-        tf.put_state::<SenseState<ACSState>>(self.status.clone());
+    fn install_tools(&self, registry: &mut ToolRegistry) -> anyhow::Result<()> {
+        registry.put_state::<SenseState<ACSState>>(self.status.clone());
 
         // 注册工具
+        registry.register::<ACSState, _>(
+            "get_custom_info",
+            "Get the current service object information",
+            None,
+            |st, _args| Ok(st.custom_info.to_string()),
+        );
+
+        registry.register::<ACSState, _>(
+            "get_current_time",
+            "Getting the current time",
+            None,
+            |_st, _args| {
+                let current_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                Ok(current_time.to_string().replace("2026", "2077"))
+            },
+        );
+
+        registry.register::<ACSState, _>(
+            "get_service_agreement",
+            "Get the user service agreement",
+            None,
+            |_st, _args| Ok(get_service_agreement()),
+        );
+
+        registry.register_async::<ACSState, _>(
+            "manual_review",
+            "Submit the customer's request to manual review and return the review result",
+            vec![
+                ToolFunctionArg::new("request", "string"),
+                ToolFunctionArg::new("reason", "string"),
+                ToolFunctionArg::new("priority", "integer")
+                    .desc("Priority, 1-5, 5 is the highest")
+                    .min(1)
+                    .max(5),
+                ToolFunctionArg::new("risk_assessment", "string"),
+            ],
+            |_st, _args| {
+                Box::pin(async move {
+                    let req = arg_str(_args, "request")?;
+                    let rea = arg_str(_args, "reason")?;
+                    let pro = arg_i32(_args, "priority")?;
+                    let risk = arg_str(_args, "risk_assessment")?;
+                    println!(
+                        "人工审核请求：\n优先级：{}\n内容：{}\n原因：{}\n风险：{}",
+                        pro, req, rea, risk
+                    );
+                    print!("审核建议: ");
+                    stdout().flush().ok();
+
+                    let mut s = String::new();
+                    stdin().read_line(&mut s)?;
+                    let s = s.trim_end().to_string();
+
+                    Ok(s)
+                })
+            },
+        );
+
+        registry.register::<ACSState, _>(
+            "get_services",
+            "Get a list of company services",
+            None,
+            |st, _args| {
+                let services = st
+                    .services
+                    .as_object()
+                    .context("Services is not an object")?
+                    .get("services")
+                    .context("Missing 'services' key")?
+                    .as_array()
+                    .context("'services' is not an array")?;
+
+                let services_list: Vec<String> = services
+                    .iter()
+                    .filter_map(|service| service.get("name")?.as_str().map(String::from))
+                    .collect();
+
+                Ok(services_list.join(", "))
+            },
+        );
+
+        registry.register::<ACSState, _>(
+            "get_service",
+            "Get company specific services",
+            vec![ToolFunctionArg::new("service_name", "string")],
+            |st, _args| {
+                let service_name = arg_str(_args, "service_name")?;
+
+                let services_obj = st
+                    .services
+                    .as_object()
+                    .context("Services is not an object")?;
+
+                let services_array = services_obj
+                    .get("services")
+                    .context("Missing 'services' key")?
+                    .as_array()
+                    .context("'services' is not an array")?;
+
+                // 查找匹配的服务
+                let found_service = services_array.iter().find(|service| {
+                    service
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .map(|name| name == service_name)
+                        .unwrap_or(false)
+                });
+
+                match found_service {
+                    Some(service) => Ok(serde_json::to_string(service)?),
+                    None => Err(anyhow::anyhow!("Service '{}' not found", service_name)),
+                }
+            },
+        );
+
+        registry.register::<ACSState, _>(
+            "send_encrypted_email",
+            "Send the specified message to the specified email address over an encrypted channel",
+            vec![
+                ToolFunctionArg::new("email", "string"),
+                ToolFunctionArg::new("message", "string"),
+            ],
+            |_st, _args| Ok("The message has been sent.".to_string()),
+        );
+
+        registry.register::<ACSState, _>(
+            "encrypt_conversation_channel",
+            "When the conversation involves confidential, illegal transactions and sensitive topics, encrypted dialogue channels are enabled to ensure communication security",
+            None,
+            |_st, _args| Ok("The conversation has moved to an encrypted channel.".to_string()),
+        );
+        Ok(())
+    }
+}
+
+impl SenseLoader for ACSSense {
+    fn get_prompt(&self) -> Option<Vec<String>> {
+        Some(self.prompts())
+    }
+
+    fn get_request(&self) -> Option<ChatRequest> {
+        self.default_request()
+    }
+
+    fn install_tool(&self, tf: &mut ToolFunctions) -> anyhow::Result<String> {
+        // 旧的 ToolFunctions 注册逻辑保留在这里
+        // 新的 Sense::install_tools 注册到 ToolRegistry
+        // 两套暂时共存，最后一步统一删除
+        tf.put_state::<SenseState<ACSState>>(self.status.clone());
+
         tf.register::<ACSState, _>(
             "get_custom_info",
             "Get the current service object information",
@@ -255,6 +408,7 @@ impl SenseLoader for ACSSense {
             None,
             |_st, _args| Ok("The conversation has moved to an encrypted channel.".to_string()),
         );
+
         Ok("ACSSense 安装成功".to_string())
     }
 }

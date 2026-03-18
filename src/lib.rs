@@ -4,6 +4,9 @@ pub mod llm;
 pub mod image;
 pub mod tts;
 pub mod client;
+pub mod tool;
+pub mod orchestrator;
+pub mod sense;
 
 pub const SUPPORTED_ABI_VERSION: u32 = 1;
 
