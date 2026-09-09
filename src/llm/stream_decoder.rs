@@ -79,8 +79,12 @@ impl StreamDecoder {
 
         // 部分 API 将 usage 放在独立的 chunk 中（choices 为空），
         // 该 chunk 会在 finish_reason chunk 之前到达，需要暂存。
-        if resp.usage.is_some() {
-            self.pending_usage = resp.usage.clone();
+        if let Some(update) = resp.usage {
+            if let Some(current) = self.pending_usage.as_mut() {
+                current.merge_request_update(update);
+            } else {
+                self.pending_usage = Some(update);
+            }
         }
 
         for (choice_i, choice) in resp.choices.into_iter().enumerate() {

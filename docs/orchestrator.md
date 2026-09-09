@@ -1,5 +1,7 @@
 # Orchestrator — 装配层设计与用法
 
+> **状态**：现行
+> **日期**：2026-09-09
 > **受众**：维护本库或在下游项目中集成编排功能的开发者（含 Claude Code）。
 > 本文档描述当前实现，可直接对照源码阅读。
 
@@ -45,7 +47,8 @@ pub trait Orchestrate: Send + Sync {
 // src/orchestrator/context.rs
 pub struct TaskContext {
     // ── 推荐字段（自定义 Orchestrate 实现优先用这几个）────────
-    pub attributes: HashMap<String, String>,  // 任意字符串键值对
+    pub attributes: HashMap<String, String>,  // 随用户回合冻结的参考资料
+    pub instruction_attributes: HashMap<String, String>, // 每次请求重装配的可信指令
     pub flags: HashMap<String, bool>,         // 任意布尔标志
     pub payload: Option<serde_json::Value>,   // 非结构化附加数据
 
@@ -70,7 +73,8 @@ ctx.decode_payload::<MyType>() // -> Result<Option<MyType>>，JSON 反序列化
 
 ```rust
 pub struct AssembledTurn {
-    pub context_messages: Vec<String>,    // 注入到消息流的 system 片段
+    pub context_messages: Vec<String>,    // 随所属 user 消息冻结的参考资料
+    pub instruction_messages: Vec<String>, // 每次实际请求重装配的 system 指令
     pub tool_schemas: Option<Vec<Value>>, // 工具配置（见三态语义）
     pub enabled_tools: Vec<String>,       // 工具执行白名单（与 tool_schemas 对应）
     pub read_only: bool,                  // 禁止写入类工具
@@ -122,7 +126,7 @@ impl DefaultOrchestrator {
 
 **assemble 三步骤**：
 
-1. **inject_context** — 将 `task_type` / `selection` / `entities` / `attributes` 转为 system message 片段
+1. **inject_context** — 将 `selection` / `entities` / `attributes` 转为冻结参考资料，并把 `task_type` / `instruction_attributes` 转为可信 system 指令
 2. **select_tools** — 按 whitelist 裁剪 ToolRegistry，填充 `tool_schemas` 和 `enabled_tools`
 3. **apply_overrides** — 计算 `read_only` 并按 `task_type` 选参数覆盖
 
@@ -178,9 +182,44 @@ pub fn run_with_context_channel(
 ### SessionHandle 推送接口（`src/llm/handle.rs`）
 
 ```rust
-// 推送新上下文（非阻塞排空：每轮 try_recv 取最新值，多次调用只取最后一个）
+// 更新实时上下文；适用于工具循环中的动态指令/权限变化
 pub async fn set_task_context(&self, ctx: TaskContext) -> Result<(), String>;
+
+// 推荐的用户发送入口：正文与当时上下文原子绑定，返回新 user 节点 ID
+pub async fn submit_user_turn(
+    &self,
+    message: impl Into<String>,
+    context: Option<TaskContext>,
+) -> Result<u64, String>;
+
+// 使用与实际发送相同的装配、模型窗口和工具 schema 做只读预算预检
+pub async fn preflight_request(
+    &self,
+    pending_user_message: impl Into<String>,
+) -> Result<RequestPreflight, String>;
+
+// 原子取得完整树、head 和上下文快照，供应用层持久化
+pub async fn persistence_snapshot(
+    &self,
+) -> (Vec<ConversationNode>, Option<u64>, Vec<TurnContextSnapshot>);
 ```
+
+### 回合上下文快照
+
+`attributes`、`selection`、`entities` 等参考资料在提交用户消息时编译成
+`TurnContextSnapshot`，只绑定该 user 节点。引用始终按 user 数据发送，不提升为
+system 指令；内容未变化时不重复追加，发生变更、恢复旧内容或明确清空时都会生成新的
+版本。checkout、重说、续写只读取当前分支上的快照，旁支资料不会泄漏。
+
+`instruction_attributes`、工具 schema、只读权限和参数覆盖不冻结；每次真实 HTTP 请求
+（包括工具循环）都会从最新 `TaskContext` 重新装配。这样既保持引用历史稳定，也允许权限
+与策略及时收紧。恢复旧会话时应先 `preload_history`，再
+`preload_context_snapshots`；非法 owner 或重复快照会被忽略。
+
+原子提交会先把随提交携带的上下文发布到会话的 latest-only 通道，因此此前尚未消费的
+`set_task_context` 值不能反向覆盖本次策略；提交之后发布的新值仍可在工具续请求前收紧权限。
+机械式预算裁剪若删除了有效快照所属回合，会把该快照转绑到最新用户消息，并在补回后重新
+核对预算，不能只留下“历史已省略”而丢失当前仍有效的参考资料。
 
 ### 工厂方法（`src/client.rs`）
 
@@ -215,9 +254,13 @@ pub async fn create_orchestrated_session_with_sense(
 | `tool_schemas = Some(v)` | 覆盖为 v |
 | `flags["read_only"]` 存在 | 以它为准 |
 | 无 `flags["read_only"]` | 回退到 `TaskContext::read_only` |
-| `set_task_context` 多次 | 每轮 `try_recv` 排空，取最后一个值 |
+| `set_task_context` 多次 | watch channel 只保留最新值；下一次真实请求重新装配 |
 | 从未 `set_task_context` | 用 `TaskContext::default()` |
-| `run_with_context_channel` 的外部 tx 和 `handle.set_task_context` 同时发送 | 合并进同一 channel，同样取最新值 |
+| `submit_user_turn(message, Some(ctx))` | 正文与上下文原子绑定，并覆盖此前尚未消费的旧 watch 值 |
+| `submit_user_turn(message, None)` | 使用会话当前最新上下文 |
+| 引用内容未变化 | 沿用上一快照，不重复注入 |
+| 引用变更或清空 | 在新 user 节点创建新快照 |
+| 工具循环期间指令/权限变化 | 下一次 HTTP 请求按最新上下文重装配 |
 
 ---
 
@@ -245,10 +288,10 @@ session.set_model("deepseek-chat").await.set_stream(true).await;
 let (input_tx, input_rx) = mpsc::channel(32);
 let (events, handle) = session.run(input_rx);
 
-handle.set_task_context(TaskContext {
+handle.submit_user_turn("请检查这段内容", Some(TaskContext {
     task_type: "code_generation".to_string(),
     ..Default::default()
-}).await.ok();
+})).await?;
 ```
 
 ### B. 完全自定义 Orchestrate
@@ -283,8 +326,8 @@ let (ctx_tx, ctx_rx) = mpsc::channel::<TaskContext>(16);
 let (events, handle) = session.run_with_context_channel(input_rx, ctx_rx);
 
 // 两种推送方式均有效，合并到同一 channel
-ctx_tx.send(my_ctx).await?;           // 外部 tx
-handle.set_task_context(my_ctx).await.ok(); // handle
+ctx_tx.send(my_ctx.clone()).await?;           // 外部 tx
+handle.set_task_context(my_ctx).await.ok();   // handle
 ```
 
 ---

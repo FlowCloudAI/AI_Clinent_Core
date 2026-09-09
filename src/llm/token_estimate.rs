@@ -163,6 +163,15 @@ fn tools_fingerprint(request: &ChatRequest) -> u64 {
     hasher.finish()
 }
 
+/// 对完整有效请求生成稳定指纹，用于绑定预算预检的 head、上下文与配置版本。
+pub(crate) fn request_fingerprint(request: &ChatRequest) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    serde_json::to_vec(request)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
 /// 单会话 EMA 校准器；跨会话持久化由上层按供应商与模型负责。
 #[derive(Clone, Debug)]
 pub struct TokenCalibrator {

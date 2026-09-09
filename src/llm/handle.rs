@@ -1,6 +1,7 @@
 use crate::ThinkingType;
+use crate::llm::context_snapshot::TurnContextSnapshot;
 use crate::llm::tree::{ConversationNode, ConversationTree};
-use crate::llm::types::{ChatRequest, CtrlMsg, Message};
+use crate::llm::types::{ChatRequest, CtrlMsg, Message, RequestPreflight};
 use crate::orchestrator::TaskContext;
 use crate::plugin::types::ThinkingEffort;
 use serde_json::Value;
@@ -20,6 +21,7 @@ pub struct SessionHandle {
     pub(crate) inner: Arc<RwLock<ChatRequest>>,
     pub(crate) tree: Arc<RwLock<ConversationTree>>,
     pub(crate) system_messages: Arc<Vec<Message>>,
+    pub(crate) context_snapshots: Arc<RwLock<Vec<TurnContextSnapshot>>>,
     pub(crate) ctrl_tx: mpsc::Sender<CtrlMsg>,
     pub(crate) cancel_tx: watch::Sender<u64>,
     pub(crate) ctx_tx: watch::Sender<TaskContext>,
@@ -197,6 +199,24 @@ impl SessionHandle {
         (tree.all_nodes().into_iter().cloned().collect(), tree.head())
     }
 
+    /// 在一致的锁顺序下取得持久化所需的消息树与回合上下文快照。
+    pub async fn persistence_snapshot(
+        &self,
+    ) -> (Vec<ConversationNode>, Option<u64>, Vec<TurnContextSnapshot>) {
+        let tree = self.tree.read().await;
+        let context_snapshots = self.context_snapshots.read().await;
+        (
+            tree.all_nodes().into_iter().cloned().collect(),
+            tree.head(),
+            context_snapshots.clone(),
+        )
+    }
+
+    /// 获取全部回合上下文快照（含非当前分支）。
+    pub async fn get_context_snapshots(&self) -> Vec<TurnContextSnapshot> {
+        self.context_snapshots.read().await.clone()
+    }
+
     /// 获取指定节点详情。
     pub async fn get_node(&self, id: u64) -> Option<ConversationNode> {
         self.tree.read().await.get_node(id).cloned()
@@ -226,5 +246,57 @@ impl SessionHandle {
     /// 高级用法：可在同一轮之间多次调用，Session 只会取最后一个值。
     pub async fn set_task_context(&self, ctx: TaskContext) -> Result<(), String> {
         self.ctx_tx.send(ctx).map_err(|_| "会话已关闭".to_string())
+    }
+
+    /// 以发送时相同的历史、上下文、模型和工具装配下一条用户消息，并返回预算预检。
+    ///
+    /// 该操作不写入消息树、不请求模型，也不会推进会话状态。
+    pub async fn preflight_request(
+        &self,
+        pending_user_message: impl Into<String>,
+    ) -> Result<RequestPreflight, String> {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.ctrl_tx
+            .send(CtrlMsg::Preflight {
+                pending_user_message: pending_user_message.into(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| "会话已关闭".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "会话预检已关闭".to_string())?
+            .map_err(|error| error.to_string())
+    }
+
+    /// 原子提交用户正文与提交时上下文，并等待消息树写入完成。
+    ///
+    /// 与先调用 `set_task_context` 再写字符串输入通道相比，该接口不会把迟到的
+    /// 页面上下文绑定到错误用户回合；工具循环中的实时上下文更新仍可继续生效。
+    pub async fn submit_user_turn(
+        &self,
+        message: impl Into<String>,
+        context: Option<TaskContext>,
+    ) -> Result<u64, String> {
+        // 原子提交同时更新 latest-only 通道，使此前尚未被 drive 消费的旧 watch 值
+        // 不会在用户节点写入后反向覆盖本次提交。之后发布的新上下文仍可在工具循环前生效。
+        if let Some(context) = context.as_ref() {
+            self.ctx_tx
+                .send(context.clone())
+                .map_err(|_| "会话已关闭".to_string())?;
+        }
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        self.ctrl_tx
+            .send(CtrlMsg::SubmitUserTurn {
+                message: message.into(),
+                context,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| "会话已关闭".to_string())?;
+        response_rx
+            .await
+            .map_err(|_| "会话提交已关闭".to_string())?
+            .map_err(|error| error.to_string())
     }
 }

@@ -4,6 +4,17 @@
 
 use super::*;
 
+fn merge_stream_usage(current: &mut Option<Usage>, update: Option<Usage>) {
+    let Some(update) = update else {
+        return;
+    };
+    if let Some(current) = current.as_mut() {
+        current.merge_request_update(update);
+    } else {
+        *current = Some(update);
+    }
+}
+
 // ── 插件映射（核心变化点） ──
 
 impl LLMSession {
@@ -43,10 +54,16 @@ impl LLMSession {
             ));
         }
 
+        self.request_id = self.request_id.saturating_add(1);
+        let request_id = self.request_id;
         let calibration_factor = self.token_calibrator.factor();
         let (request_head, head_path) = {
             let tree = self.tree.read().await;
             (tree.head(), tree.path_to_head())
+        };
+        let required_user_context = {
+            let snapshots = self.context_snapshots.read().await;
+            Self::latest_context_snapshot_on_path(&head_path, &snapshots).map(render_reference)
         };
         let baseline = self
             .last_baseline
@@ -66,12 +83,13 @@ impl LLMSession {
         );
         let mut outgoing = req.clone();
         if let Some(context_window_tokens) = self.config.context_window_tokens
-            && let Some(report) = trim_request_for_window(
+            && let Some(report) = trim_request_for_window_preserving_context(
                 &mut outgoing,
                 context_window_tokens,
                 calibration_factor,
                 baseline.as_ref(),
                 TrimOptions::NORMAL,
+                required_user_context.as_deref(),
             )?
         {
             Self::emit_context_trimmed(event_tx, &report).await?;
@@ -79,6 +97,8 @@ impl LLMSession {
 
         let base_estimate = estimate_request_tokens(&outgoing);
         let first_result = self.send_once(&outgoing, cancel, event_tx).await;
+        Self::emit_request_usage(event_tx, self.usage_turn_id, request_id, 1, &first_result)
+            .await?;
         let Err(ref error) = first_result else {
             self.observe_token_usage(&outgoing, request_head, base_estimate, &first_result);
             return first_result;
@@ -122,12 +142,13 @@ impl LLMSession {
                     )
                 },
             );
-            let report = trim_request_to_budget_with_baseline(
+            let report = trim_request_to_budget_with_baseline_preserving_context(
                 &mut repaired,
                 budget,
                 calibration_factor,
                 TrimOptions::OVERFLOW_RETRY.force_drop_oldest_round,
                 baseline.as_ref(),
+                required_user_context.as_deref(),
             )?
             .ok_or_else(|| {
                 context_budget_error_with_baseline(
@@ -144,6 +165,14 @@ impl LLMSession {
         };
         let repaired_estimate = estimate_request_tokens(&repaired);
         let repaired_result = self.send_once(&repaired, cancel, event_tx).await;
+        Self::emit_request_usage(
+            event_tx,
+            self.usage_turn_id,
+            request_id,
+            2,
+            &repaired_result,
+        )
+        .await?;
         self.observe_token_usage(&repaired, request_head, repaired_estimate, &repaired_result);
         if let (Some(budget), Err(error)) = (retry_budget, &repaired_result)
             && ClientError::from_anyhow(error).is_some_and(Self::is_context_overflow_error)
@@ -157,6 +186,27 @@ impl LLMSession {
             .into());
         }
         repaired_result
+    }
+
+    async fn emit_request_usage(
+        event_tx: &mpsc::Sender<SessionEvent>,
+        turn_id: u64,
+        request_id: u64,
+        attempt: u32,
+        result: &Result<TurnOutput>,
+    ) -> Result<()> {
+        let Ok((_, _, _, _, _, Some(usage))) = result else {
+            return Ok(());
+        };
+        event_tx
+            .send(SessionEvent::RequestUsage {
+                turn_id,
+                request_id,
+                attempt,
+                usage: usage.clone(),
+            })
+            .await?;
+        Ok(())
     }
 
     async fn emit_context_trimmed(
@@ -442,7 +492,7 @@ impl LLMSession {
             tool_calls,
             Some(finish_reason),
             TurnStatus::Ok,
-            Some(res.usage),
+            res.usage,
         ))
     }
 
@@ -523,13 +573,14 @@ impl LLMSession {
         let mut usage: Option<Usage> = None;
         let mut line_count = 0usize;
         let mut saw_tool_call_start = false;
+        let mut tool_calls_ready = false;
 
         'outer: loop {
             let raw_line = tokio::select! {
                 _ = cancel.cancelled() => {
                     turn_status = TurnStatus::Cancelled;
                     finish_reason = Some("cancelled".to_string());
-                    usage = decoder.take_pending_usage();
+                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
                     break 'outer;
                 }
                 raw_line = stream.next() => {
@@ -552,7 +603,7 @@ impl LLMSession {
                     );
                     turn_status = TurnStatus::Error(error);
                     finish_reason = Some("interrupted".to_string());
-                    usage = decoder.take_pending_usage();
+                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
                     break 'outer;
                 }
                 Err(error) => return Err(error),
@@ -560,7 +611,7 @@ impl LLMSession {
             if cancel.is_cancelled() {
                 turn_status = TurnStatus::Cancelled;
                 finish_reason = Some("cancelled".to_string());
-                usage = decoder.take_pending_usage();
+                merge_stream_usage(&mut usage, decoder.take_pending_usage());
                 break 'outer;
             }
             line_count += 1;
@@ -590,7 +641,7 @@ impl LLMSession {
                     );
                     turn_status = TurnStatus::Error(error);
                     finish_reason = Some("interrupted".to_string());
-                    usage = decoder.take_pending_usage();
+                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
                     break 'outer;
                 }
                 Err(error) => return Err(error),
@@ -612,7 +663,7 @@ impl LLMSession {
                         );
                         turn_status = TurnStatus::Error(error);
                         finish_reason = Some("interrupted".to_string());
-                        usage = decoder.take_pending_usage();
+                        merge_stream_usage(&mut usage, decoder.take_pending_usage());
                         break 'outer;
                     }
                     Err(error) => return Err(error),
@@ -650,20 +701,23 @@ impl LLMSession {
                     }
 
                     DecoderEventPayload::ToolCallsRequired => {
-                        // 取出可能已被暂存的 usage（部分 API 在 tool_calls 之前发送 usage chunk）
-                        usage = decoder.take_pending_usage();
-                        tool_calls = acc.build_calls(self.turn_id);
-                        for call in &tool_calls {
-                            event_tx
-                                .send(SessionEvent::ToolCall {
-                                    index: call.index,
-                                    name: call.function.name.clone(),
-                                    arguments: call.function.arguments.clone(),
-                                })
-                                .await?;
+                        // tool_calls 只表示生成内容结束，不表示 HTTP 流已经结束。部分供应商会在
+                        // 其后发送 usage-only chunk；继续读到 [DONE]/EOF，避免漏掉本次请求计量。
+                        merge_stream_usage(&mut usage, decoder.take_pending_usage());
+                        if !tool_calls_ready {
+                            tool_calls = acc.build_calls(self.turn_id);
+                            for call in &tool_calls {
+                                event_tx
+                                    .send(SessionEvent::ToolCall {
+                                        index: call.index,
+                                        name: call.function.name.clone(),
+                                        arguments: call.function.arguments.clone(),
+                                    })
+                                    .await?;
+                            }
                         }
+                        tool_calls_ready = true;
                         finish_reason = Some("tool_calls".to_string());
-                        break 'outer;
                     }
 
                     DecoderEventPayload::TurnEnd {
@@ -672,8 +726,11 @@ impl LLMSession {
                         usage: u,
                     } => {
                         turn_status = status.clone();
-                        if u.is_some() {
-                            usage = u;
+                        merge_stream_usage(&mut usage, u);
+                        if tool_calls_ready && matches!(turn_status, TurnStatus::Ok) {
+                            // [DONE] 常被标准化为 stop；已经完整收到工具调用时必须保留原结束原因。
+                            finish_reason = Some("tool_calls".to_string());
+                            break 'outer;
                         }
                         let normalized_finish_reason = match &turn_status {
                             TurnStatus::Ok => stream_finish_reason
@@ -744,6 +801,7 @@ impl LLMSession {
             }
         }
 
+        merge_stream_usage(&mut usage, decoder.take_pending_usage());
         if finish_reason.is_none() {
             // 部分 API（如 DeepSeek v4 代理）不在流式 chunk 中携带
             // finish_reason，而是仅以 [DONE] 或 TCP 关闭表示结束。
@@ -751,10 +809,6 @@ impl LLMSession {
             finish_reason = Some("stop".to_string());
             if !matches!(turn_status, TurnStatus::Error(_)) {
                 turn_status = TurnStatus::Ok;
-            }
-            // 尝试取出可能已被暂存在 decoder 中的 usage
-            if usage.is_none() {
-                usage = decoder.take_pending_usage();
             }
         }
 

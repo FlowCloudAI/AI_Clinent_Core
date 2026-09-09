@@ -16,10 +16,15 @@ pub use audio::{AudioDecoder, AudioSource};
 pub use client::FlowCloudAIClient;
 pub use error::{ClientError, ErrorCode};
 pub use image::ImageSession;
+pub use llm::context_snapshot::{
+    ContextSnapshotPlacement, ContextSnapshotSource, TurnContextSnapshot,
+};
 pub use llm::handle::SessionHandle;
 pub use llm::session::LLMSession;
 pub use llm::tree::{ConversationNode, ConversationNodeSeed};
-pub use llm::types::{Message, SessionEvent, ThinkingType, ToolCall, TurnStatus, Usage};
+pub use llm::types::{
+    Message, RequestPreflight, SessionEvent, ThinkingType, ToolCall, TurnStatus, Usage,
+};
 pub use orchestrator::{AssembledTurn, DefaultOrchestrator, Orchestrate, TaskContext};
 pub use plugin::manager::{PluginLoadError, PluginLoadReport};
 pub use plugin::types::{ModelInfo, PluginKind, ThinkingEffort};

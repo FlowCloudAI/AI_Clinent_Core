@@ -11,7 +11,7 @@ use crate::llm::types::{
     ChatRequest, Message, SessionEvent, ToolCall, ToolFunctionArg, ToolFunctionCall, TurnStatus,
     Usage,
 };
-use crate::orchestrator::TaskContext;
+use crate::orchestrator::{DefaultOrchestrator, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
 use crate::plugin::registry::PluginRegistry;
 use crate::tool::ToolFailure;
@@ -39,6 +39,12 @@ fn new_test_session_with_registry(tool_registry: ToolRegistry) -> LLMSession {
         ..SessionConfig::default()
     };
     LLMSession::new(config, pipeline, Arc::new(tool_registry)).unwrap()
+}
+
+fn enable_default_orchestrator(session: &mut LLMSession) {
+    session.set_orchestrator(Box::new(DefaultOrchestrator::new(Arc::clone(
+        &session.tool_registry,
+    ))));
 }
 
 fn stored_message(
@@ -171,8 +177,16 @@ enum MockReply {
         content: String,
         requests: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
     },
+    StreamDoneWithUsage {
+        content: String,
+        usage_updates: Vec<serde_json::Value>,
+    },
     StreamToolCall {
         name: String,
+    },
+    StreamToolCallWithUsage {
+        name: String,
+        usage: serde_json::Value,
     },
 }
 
@@ -271,10 +285,30 @@ async fn handle_mock_connection(mut socket: TcpStream, reply: MockReply) {
             let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
             let _ = socket.flush().await;
         }
+        MockReply::StreamDoneWithUsage {
+            content,
+            usage_updates,
+        } => {
+            let _ = write_stream_headers(&mut socket).await;
+            let _ = write_sse_line(&mut socket, stream_content_chunk(&content, Some("stop"))).await;
+            for usage in usage_updates {
+                let _ = write_sse_line(&mut socket, stream_usage_chunk(usage)).await;
+            }
+            let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+            let _ = socket.flush().await;
+        }
         MockReply::StreamToolCall { name } => {
             let _ = write_stream_headers(&mut socket).await;
             let _ = write_sse_line(&mut socket, stream_tool_call_chunk(&name)).await;
             let _ = write_sse_line(&mut socket, stream_tool_finish_chunk()).await;
+            let _ = socket.flush().await;
+        }
+        MockReply::StreamToolCallWithUsage { name, usage } => {
+            let _ = write_stream_headers(&mut socket).await;
+            let _ = write_sse_line(&mut socket, stream_tool_call_chunk(&name)).await;
+            let _ = write_sse_line(&mut socket, stream_tool_finish_chunk()).await;
+            let _ = write_sse_line(&mut socket, stream_usage_chunk(usage)).await;
+            let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
             let _ = socket.flush().await;
         }
     }
@@ -490,6 +524,18 @@ fn stream_tool_finish_chunk() -> String {
     .to_string()
 }
 
+fn stream_usage_chunk(usage: serde_json::Value) -> String {
+    serde_json::json!({
+        "id": "chunk-usage",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "mock-model",
+        "choices": [],
+        "usage": usage
+    })
+    .to_string()
+}
+
 async fn wait_for_request_count(count: &Arc<AtomicUsize>, expected: usize) {
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
@@ -544,6 +590,79 @@ async fn wait_for_turn_end(
             None => panic!("事件流提前结束"),
         }
     }
+}
+
+#[tokio::test]
+async fn 工具结束后的用量尾包逐条发出且回合汇总不重复() {
+    let (url, request_count) = spawn_mock_server(vec![
+        MockReply::StreamToolCallWithUsage {
+            name: "unused_tool".to_string(),
+            usage: serde_json::json!({
+                "prompt_tokens": 10,
+                "completion_tokens": 2,
+                "total_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 4}
+            }),
+        },
+        MockReply::StreamDoneWithUsage {
+            content: "完成".to_string(),
+            usage_updates: vec![
+                serde_json::json!({
+                    "prompt_tokens": 20,
+                    "completion_tokens": 1,
+                    "total_tokens": 21,
+                    "prompt_tokens_details": {"cached_tokens": 10}
+                }),
+                serde_json::json!({
+                    "prompt_tokens": 22,
+                    "completion_tokens": 3,
+                    "total_tokens": 25,
+                    "prompt_tokens_details": {"cached_tokens": 15}
+                }),
+            ],
+        },
+    ])
+    .await;
+    let mut session = new_http_test_session(url, true, Arc::new(ToolRegistry::new())).await;
+    session.config.max_tool_rounds = 0;
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (mut events, _handle) = session.try_run(input_rx).unwrap();
+    input_tx.send("执行任务".to_string()).await.unwrap();
+
+    let mut request_usages = Vec::new();
+    let turn_usage = loop {
+        match events.next().await {
+            Some(SessionEvent::RequestUsage {
+                turn_id,
+                request_id,
+                attempt,
+                usage,
+            }) => request_usages.push((turn_id, request_id, attempt, usage)),
+            Some(SessionEvent::TurnEnd { usage, .. }) => break usage.unwrap(),
+            Some(SessionEvent::Error(error)) => panic!("收到错误事件: {error}"),
+            Some(_) => {}
+            None => panic!("事件流提前结束"),
+        }
+    };
+
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
+    assert_eq!(request_usages.len(), 2);
+    assert!(request_usages[0].0 > 0);
+    assert_eq!(request_usages[0].0, request_usages[1].0);
+    assert_eq!(request_usages[0].1, 1);
+    assert_eq!(request_usages[1].1, 2);
+    assert_eq!(request_usages[0].2, 1);
+    assert_eq!(request_usages[1].2, 1);
+    assert_eq!(request_usages[0].3.cached_prompt_tokens, Some(4));
+    assert_eq!(request_usages[1].3.total_tokens, 25);
+    assert_eq!(request_usages[1].3.cached_prompt_tokens, Some(15));
+    assert_eq!(turn_usage.prompt_tokens, 32);
+    assert_eq!(turn_usage.completion_tokens, 5);
+    assert_eq!(turn_usage.total_tokens, 37);
+    assert_eq!(turn_usage.cached_prompt_tokens, Some(19));
+    assert_eq!(turn_usage.request_count, 2);
+    assert_eq!(turn_usage.cache_usage_known_requests, 2);
+    drop(input_tx);
 }
 
 #[tokio::test]
@@ -1157,6 +1276,52 @@ async fn set_task_context_keeps_latest_without_waiting_for_drive() {
     drop(input_tx);
 }
 
+#[tokio::test]
+async fn 请求预检使用真实装配且不推进消息树() {
+    let registry = Arc::new(ToolRegistry::new());
+    let pipeline = ApiPipeline::try_new(Arc::new(PluginRegistry::empty().unwrap()), None).unwrap();
+    let config = SessionConfig {
+        base_url: "https://example.test".to_string(),
+        api_key: "test-key".into(),
+        context_window_tokens: Some(4_096),
+        ..SessionConfig::default()
+    };
+    let mut session = LLMSession::new(config, pipeline, Arc::clone(&registry)).unwrap();
+    session.set_model("mock-model").await;
+    session.with_orchestrator(crate::DefaultOrchestrator::new(registry));
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (mut events, handle) = session.try_run(input_rx).unwrap();
+    assert!(matches!(events.next().await, Some(SessionEvent::NeedInput)));
+
+    let mut context = TaskContext::default();
+    context
+        .attributes
+        .insert("project".to_string(), "合成项目".to_string());
+    handle.set_task_context(context).await.unwrap();
+    let before = handle.get_conversation().await;
+    let first = handle.preflight_request("下一条消息").await.unwrap();
+    let second = handle.preflight_request("下一条消息").await.unwrap();
+    let after = handle.get_conversation().await;
+
+    assert_eq!(first, second);
+    assert_eq!(first.context_window_tokens, Some(4_096));
+    assert!(first.output_reserve_tokens.is_some());
+    assert!(first.safety_reserve_tokens.is_some());
+    assert!(first.input_budget_tokens.is_some());
+    assert_eq!(first.suggest_compaction, Some(false));
+    assert_eq!(before.messages.len(), after.messages.len());
+    assert_eq!(before.model, after.model);
+
+    let mut changed = TaskContext::default();
+    changed
+        .attributes
+        .insert("project".to_string(), "另一个项目".to_string());
+    handle.set_task_context(changed).await.unwrap();
+    let changed = handle.preflight_request("下一条消息").await.unwrap();
+    assert_ne!(first.request_fingerprint, changed.request_fingerprint);
+    drop(input_tx);
+}
+
 #[derive(Clone)]
 struct SlowToolState {
     started: Arc<AtomicBool>,
@@ -1237,84 +1402,345 @@ async fn tool_execution_cancel_stops_followup_turn() {
 }
 
 #[test]
-fn context_insert_index_before_pending_block_keeps_latest_user_anchor() {
-    let messages = vec![
-        Message::system("基础系统提示"),
-        Message::user("旧问题"),
-        Message::assistant(Some("旧回答"), None::<String>, None),
-        Message::user("新问题"),
-    ];
+fn apply_assembled_只在系统前缀注入可信指令且不提升参考材料() {
+    let session = new_test_session();
+    let request = ChatRequest {
+        messages: vec![Message::system("基础系统提示"), Message::user("问题")],
+        ..ChatRequest::default()
+    };
+    let turn = crate::AssembledTurn {
+        context_messages: vec!["第一段".to_string(), "第二段".to_string()],
+        instruction_messages: vec!["策略一".to_string(), "策略二".to_string()],
+        ..Default::default()
+    };
 
+    let assembled = session.apply_assembled(request, &turn);
+    assert_eq!(assembled.messages.len(), 4);
     assert_eq!(
-        LLMSession::context_insert_index_before_pending_block(&messages),
-        3
+        assembled.messages[0].content.as_deref(),
+        Some("基础系统提示")
+    );
+    assert_eq!(assembled.messages[1].content.as_deref(), Some("策略一"));
+    assert_eq!(assembled.messages[2].content.as_deref(), Some("策略二"));
+    assert_eq!(assembled.messages[3].content.as_deref(), Some("问题"));
+    assert!(
+        assembled.messages.iter().all(|message| {
+            !matches!(message.content.as_deref(), Some("第一段" | "第二段"))
+        })
     );
 }
 
-#[test]
-fn context_insert_index_before_pending_block_keeps_tool_call_block_adjacent() {
-    let messages = vec![
-        Message::system("基础系统提示"),
-        Message::user("帮我查天气"),
-        Message::assistant(
-            None::<String>,
-            None::<String>,
-            Some(vec![ToolCall {
-                id: Some("call_1".to_string()),
-                call_type: Some("function".to_string()),
-                function: ToolFunctionCall {
-                    name: "get_weather".to_string(),
-                    arguments: "{}".to_string(),
-                },
-                index: 0,
-            }]),
-        ),
-        Message::tool("晴天", "call_1"),
-    ];
+#[tokio::test]
+async fn 不变参考上下文只记录一次且保持上一请求前缀() {
+    let mut session = new_test_session();
+    enable_default_orchestrator(&mut session);
+    let mut ctx = TaskContext::default();
+    ctx.attributes
+        .insert("entry".to_string(), "固定参考".to_string());
 
+    let first_user = session
+        .capture_user_turn("第一问".to_string(), &ctx)
+        .await
+        .unwrap();
+    let first_request = session.snapshot().await;
+    session
+        .add_message(Message::assistant(Some("第一答"), None::<String>, None))
+        .await;
+    session
+        .capture_user_turn("第二问".to_string(), &ctx)
+        .await
+        .unwrap();
+    let second_request = session.snapshot().await;
+
+    assert_eq!(session.context_snapshots.read().await.len(), 1);
     assert_eq!(
-        LLMSession::context_insert_index_before_pending_block(&messages),
-        2
+        session.context_snapshots.read().await[0].owner_node_id,
+        first_user
+    );
+    assert_eq!(
+        serde_json::to_value(&second_request.messages[..first_request.messages.len()]).unwrap(),
+        serde_json::to_value(&first_request.messages).unwrap()
+    );
+    assert!(
+        second_request.messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("固定参考")
+    );
+    assert_eq!(
+        second_request.messages.last().unwrap().content.as_deref(),
+        Some("第二问")
     );
 }
 
-#[test]
-fn context_insert_index_before_pending_block_keeps_multi_tool_results_adjacent() {
-    let messages = vec![
-        Message::system("基础系统提示"),
-        Message::user("帮我同时查天气和汇率"),
-        Message::assistant(
-            None::<String>,
-            None::<String>,
-            Some(vec![
-                ToolCall {
-                    id: Some("call_1".to_string()),
-                    call_type: Some("function".to_string()),
-                    function: ToolFunctionCall {
-                        name: "get_weather".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                    index: 0,
-                },
-                ToolCall {
-                    id: Some("call_2".to_string()),
-                    call_type: Some("function".to_string()),
-                    function: ToolFunctionCall {
-                        name: "get_fx_rate".to_string(),
-                        arguments: "{}".to_string(),
-                    },
-                    index: 1,
-                },
-            ]),
-        ),
-        Message::tool("晴天", "call_1"),
-        Message::tool("7.25", "call_2"),
-    ];
-
-    assert_eq!(
-        LLMSession::context_insert_index_before_pending_block(&messages),
-        2
+#[tokio::test]
+async fn 实际发送裁剪早期回合后仍携带当前有效快照() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (url, _) = spawn_mock_server(vec![MockReply::StreamDoneRecording {
+        content: "完成".to_string(),
+        requests: Arc::clone(&requests),
+    }])
+    .await;
+    let registry = Arc::new(ToolRegistry::new());
+    let mut session = new_http_test_session(url, true, Arc::clone(&registry)).await;
+    session.config.context_window_tokens = Some(3_500);
+    session.with_orchestrator(DefaultOrchestrator::new(registry));
+    let mut context = TaskContext::default();
+    context.attributes.insert(
+        "entry".to_string(),
+        format!("当前有效资料-{}", "资料".repeat(120)),
     );
+
+    for round in 1..=4 {
+        let node_id = session
+            .capture_user_turn(format!("第{round}问-{}", "问题".repeat(400)), &context)
+            .await
+            .unwrap();
+        session.usage_turn_id = node_id;
+        if round < 4 {
+            session
+                .add_message(Message::assistant(
+                    Some(format!("第{round}答-{}", "回答".repeat(400))),
+                    None::<String>,
+                    None,
+                ))
+                .await;
+        }
+    }
+
+    let request = session.snapshot().await;
+    let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(0_u64);
+    let mut cancel = TurnCancel::new(&cancel_rx);
+    let (event_tx, _event_rx) = mpsc::channel(64);
+    session
+        .send_and_process(&request, &mut cancel, &event_tx)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let rendered = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("当前有效资料"));
+    assert!(rendered.contains("第4问"));
+    assert!(!rendered.contains("第1问"));
+    assert!(rendered.contains("历史") || rendered.contains("早期"));
+}
+
+#[tokio::test]
+async fn 参考上下文变化和清空分别追加明确版本() {
+    let mut session = new_test_session();
+    enable_default_orchestrator(&mut session);
+    let mut ctx = TaskContext::default();
+    ctx.attributes
+        .insert("entry".to_string(), "版本一".to_string());
+    session
+        .capture_user_turn("第一问".to_string(), &ctx)
+        .await
+        .unwrap();
+    session
+        .add_message(Message::assistant(Some("答一"), None::<String>, None))
+        .await;
+
+    ctx.attributes
+        .insert("entry".to_string(), "版本二".to_string());
+    session
+        .capture_user_turn("第二问".to_string(), &ctx)
+        .await
+        .unwrap();
+    session
+        .add_message(Message::assistant(Some("答二"), None::<String>, None))
+        .await;
+    session
+        .capture_user_turn("第三问".to_string(), &TaskContext::default())
+        .await
+        .unwrap();
+
+    let snapshots = session.context_snapshots.read().await.clone();
+    assert_eq!(snapshots.len(), 3);
+    assert!(snapshots[2].sources.is_empty());
+    let request = session.snapshot().await;
+    assert!(
+        request.messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("版本一")
+    );
+    assert!(
+        request.messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("版本二")
+    );
+    assert!(
+        request.messages[4]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("没有有效参考材料")
+    );
+}
+
+#[tokio::test]
+async fn 分支请求只编译祖先路径上的参考快照() {
+    let mut session = new_test_session();
+    enable_default_orchestrator(&mut session);
+    let mut root_ctx = TaskContext::default();
+    root_ctx
+        .attributes
+        .insert("entry".to_string(), "共同祖先".to_string());
+    session
+        .capture_user_turn("根问题".to_string(), &root_ctx)
+        .await
+        .unwrap();
+    let assistant = session
+        .add_message(Message::assistant(Some("根回答"), None::<String>, None))
+        .await;
+
+    let mut abandoned_ctx = TaskContext::default();
+    abandoned_ctx
+        .attributes
+        .insert("entry".to_string(), "废弃分支".to_string());
+    session
+        .capture_user_turn("旧分支".to_string(), &abandoned_ctx)
+        .await
+        .unwrap();
+
+    session.tree.write().await.checkout(assistant).unwrap();
+    let mut active_ctx = TaskContext::default();
+    active_ctx
+        .attributes
+        .insert("entry".to_string(), "当前分支".to_string());
+    session
+        .capture_user_turn("新分支".to_string(), &active_ctx)
+        .await
+        .unwrap();
+
+    let request = session.snapshot().await;
+    let rendered = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("共同祖先"));
+    assert!(rendered.contains("当前分支"));
+    assert!(!rendered.contains("废弃分支"));
+}
+
+#[tokio::test]
+async fn 原子提交在实际请求中保持缓存前缀且不提升参考材料权限() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (url, _) = spawn_mock_server(vec![
+        MockReply::StreamDoneRecording {
+            content: "第一答".to_string(),
+            requests: Arc::clone(&requests),
+        },
+        MockReply::StreamDoneRecording {
+            content: "第二答".to_string(),
+            requests: Arc::clone(&requests),
+        },
+    ])
+    .await;
+    let registry = Arc::new(ToolRegistry::new());
+    let mut session = new_http_test_session(url, true, Arc::clone(&registry)).await;
+    session.with_orchestrator(DefaultOrchestrator::new(registry));
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (mut events, handle) = session.try_run(input_rx).unwrap();
+    assert!(matches!(events.next().await, Some(SessionEvent::NeedInput)));
+    let mut context = TaskContext::default();
+    context
+        .attributes
+        .insert("entry".to_string(), "固定资料".to_string());
+
+    handle
+        .submit_user_turn("第一问", Some(context.clone()))
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    assert!(matches!(events.next().await, Some(SessionEvent::NeedInput)));
+    handle
+        .submit_user_turn("第二问", Some(context))
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    drop(input_tx);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let first = requests[0]["messages"].as_array().unwrap();
+    let second = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(&second[..first.len()], first.as_slice());
+    assert_eq!(first[0]["role"], "user");
+    assert!(first[0]["content"].as_str().unwrap().contains("固定资料"));
+    assert_eq!(second.last().unwrap()["content"], "第二问");
+    assert_eq!(handle.get_context_snapshots().await.len(), 1);
+}
+
+#[tokio::test]
+async fn 原子提交策略不会被先前未消费的上下文覆盖() {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (url, _) = spawn_mock_server(vec![MockReply::StreamDoneRecording {
+        content: "完成".to_string(),
+        requests: Arc::clone(&requests),
+    }])
+    .await;
+    let registry = Arc::new(ToolRegistry::new());
+    let mut session = new_http_test_session(url, true, Arc::clone(&registry)).await;
+    session.with_orchestrator(DefaultOrchestrator::new(registry));
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (mut events, handle) = session.try_run(input_rx).unwrap();
+    assert!(matches!(events.next().await, Some(SessionEvent::NeedInput)));
+
+    let mut stale = TaskContext {
+        task_type: "creative_writing".to_string(),
+        ..TaskContext::default()
+    };
+    stale
+        .instruction_attributes
+        .insert("policy".to_string(), "旧策略".to_string());
+    stale.flags.insert("read_only".to_string(), false);
+    stale.flags.insert("auto_confirm_writes".to_string(), true);
+    handle.set_task_context(stale).await.unwrap();
+
+    let mut submitted = TaskContext {
+        task_type: "proofreading".to_string(),
+        ..TaskContext::default()
+    };
+    submitted
+        .instruction_attributes
+        .insert("policy".to_string(), "新策略".to_string());
+    submitted.flags.insert("read_only".to_string(), true);
+    submitted
+        .flags
+        .insert("auto_confirm_writes".to_string(), false);
+    handle
+        .submit_user_turn("按新策略处理", Some(submitted))
+        .await
+        .unwrap();
+    wait_for_turn_end(&mut events).await;
+    drop(input_tx);
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let rendered = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("新策略"));
+    assert!(!rendered.contains("旧策略"));
+    assert_eq!(requests[0]["temperature"].as_f64(), Some(0.1));
 }
 
 fn tc(id: Option<&str>, index: usize, name: &str) -> ToolCall {
@@ -1541,6 +1967,7 @@ fn stream_turn_end_waits_for_qwen_usage_tail() {
         prompt_tokens: 10,
         completion_tokens: 20,
         total_tokens: 30,
+        ..Usage::default()
     };
 
     assert!(!LLMSession::should_stop_after_stream_turn_end(

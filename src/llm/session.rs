@@ -4,16 +4,23 @@ use crate::llm::accumulator::ToolCallAccumulator;
 use crate::llm::config::SessionConfig;
 use crate::llm::context_budget::{
     ContextTrimReport, EstimateSource, TrimOptions, calibrated_request_tokens, context_budget,
-    context_budget_error_with_baseline, message_blocks, trim_request_for_window,
-    trim_request_to_budget_with_baseline,
+    context_budget_breakdown, context_budget_error_with_baseline,
+    trim_request_for_window_preserving_context,
+    trim_request_to_budget_with_baseline_preserving_context,
+};
+use crate::llm::context_snapshot::{
+    ContextSnapshotPlacement, PreparedContextSnapshot, TurnContextSnapshot,
+    compile_reference_message, compile_user_message, render_reference,
 };
 use crate::llm::handle::SessionHandle;
 use crate::llm::stream_decoder::StreamDecoder;
-use crate::llm::token_estimate::{RequestBaseline, TokenCalibrator, estimate_request_tokens};
+use crate::llm::token_estimate::{
+    RequestBaseline, TokenCalibrator, estimate_request_tokens, request_fingerprint,
+};
 use crate::llm::tree::{ConversationNodeSeed, ConversationTree};
 use crate::llm::types::{
-    ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, SessionEvent, ThinkingType,
-    ToolCall, TurnStatus, Usage,
+    ChatRequest, ChatResponse, CtrlMsg, DecoderEventPayload, Message, RequestPreflight,
+    SessionEvent, ThinkingType, ToolCall, TurnStatus, Usage,
 };
 use crate::orchestrator::{AssembledTurn, Orchestrate, TaskContext};
 use crate::plugin::pipeline::ApiPipeline;
@@ -115,6 +122,9 @@ pub struct LLMSession {
     /// 系统级消息（由 Sense 注入，跨分支保持不变）
     system_messages: Arc<Vec<Message>>,
 
+    /// 随用户节点绑定的参考上下文快照；UI 原始消息不在这里改写。
+    context_snapshots: Arc<RwLock<Vec<TurnContextSnapshot>>>,
+
     /// 工具函数管理器
     tool_registry: Arc<ToolRegistry>,
 
@@ -132,6 +142,12 @@ pub struct LLMSession {
 
     /// 当前轮次 ID
     turn_id: u64,
+
+    /// 当前用户回合的锚点节点；同一工具循环内保持不变。
+    usage_turn_id: u64,
+
+    /// 当前 session 实例内实际模型请求的单调编号，不进入 prompt。
+    request_id: u64,
 
     /// 从持久化历史恢复时先等待显式输入或 checkout，避免自动重放末尾未完成的用户消息。
     wait_for_input_on_start: bool,
@@ -158,12 +174,15 @@ impl LLMSession {
             conversation: Arc::new(RwLock::new(ChatRequest::default())),
             tree: Arc::new(RwLock::new(ConversationTree::new())),
             system_messages: Arc::new(Vec::new()),
+            context_snapshots: Arc::new(RwLock::new(Vec::new())),
             tool_registry,
             config,
             token_calibrator,
             last_baseline: None,
             pipeline,
             turn_id: 0,
+            usage_turn_id: 0,
+            request_id: 0,
             wait_for_input_on_start: false,
             strip_reasoning_content: false,
             orchestrator: None,
@@ -222,6 +241,39 @@ impl LLMSession {
             if let Some(h) = effective_head {
                 let _ = tree.set_head(h);
             }
+        }
+    }
+
+    /// 恢复已持久化的回合上下文快照（必须在 run() 之前调用）。
+    ///
+    /// 普通快照只接受仍存在且 role 为 user 的所属节点；压缩边界携带的
+    /// `AfterNode` 快照可绑定任意仍存在节点。旧格式缺少该字段时传空列表，
+    /// 不会从当前页面上下文反向补造历史快照。
+    pub fn preload_context_snapshots(&mut self, snapshots: Vec<TurnContextSnapshot>) {
+        let Some(tree_lock) = Arc::get_mut(&mut self.tree) else {
+            return;
+        };
+        let tree = tree_lock.get_mut();
+        let mut valid = Vec::new();
+        let mut owners = HashSet::new();
+        for snapshot in snapshots {
+            let owner_valid = tree.get_node(snapshot.owner_node_id).is_some_and(|node| {
+                snapshot.placement == ContextSnapshotPlacement::AfterNode
+                    || node.message.role == "user"
+            });
+            if owner_valid && owners.insert(snapshot.owner_node_id) {
+                valid.push(snapshot);
+            } else {
+                log::warn!(
+                    "[client:session][preload_context_snapshot_dropped] owner_node_id={} owner_valid={}",
+                    snapshot.owner_node_id,
+                    owner_valid
+                );
+            }
+        }
+        valid.sort_by_key(|snapshot| snapshot.owner_node_id);
+        if let Some(snapshot_lock) = Arc::get_mut(&mut self.context_snapshots) {
+            *snapshot_lock.get_mut() = valid;
         }
     }
 
@@ -368,6 +420,7 @@ impl LLMSession {
             inner: Arc::clone(&self.conversation),
             tree: Arc::clone(&self.tree),
             system_messages: Arc::clone(&self.system_messages),
+            context_snapshots: Arc::clone(&self.context_snapshots),
             ctrl_tx,
             cancel_tx,
             ctx_tx,
@@ -432,6 +485,7 @@ impl LLMSession {
             inner: Arc::clone(&self.conversation),
             tree: Arc::clone(&self.tree),
             system_messages: Arc::clone(&self.system_messages),
+            context_snapshots: Arc::clone(&self.context_snapshots),
             ctrl_tx: mpsc::channel::<CtrlMsg>(8).0,
             cancel_tx: watch::channel::<u64>(0).0,
             ctx_tx: watch::channel::<TaskContext>(TaskContext::default()).0,
@@ -534,14 +588,20 @@ impl LLMSession {
     }
 
     fn apply_assembled(&self, mut req: ChatRequest, turn: &AssembledTurn) -> ChatRequest {
-        let insert_at = Self::context_insert_index_before_pending_block(&req.messages);
-
-        // 注入上下文 messages。
-        // 规则固定为“插在最后一个待续会话块之前”；
-        // 若当前不存在待续会话块，则退化为插在最新用户消息之前。
-        for msg in &turn.context_messages {
-            req.messages.insert(insert_at, Message::system(msg.clone()));
-        }
+        // 可信动态指令固定放在已有 system 前缀之后；参考材料已由 snapshot() 编译进
+        // 所属 user 消息，不能在这里提升为 system 权限层级。
+        let insert_at = req
+            .messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count();
+        req.messages.splice(
+            insert_at..insert_at,
+            turn.instruction_messages
+                .iter()
+                .cloned()
+                .map(Message::system),
+        );
 
         // 工具 schemas 三态：
         //   None          → 不干预，保持 snapshot 的工具配置
@@ -565,27 +625,85 @@ impl LLMSession {
         req
     }
 
-    /// 计算 context_messages 的稳定插入点。
-    ///
-    /// “待续会话块”当前定义为请求尾部的
-    /// `assistant(tool_calls) + tool...` 连续片段。
-    /// 若检测到该片段，则返回其起始位置；
-    /// 否则退化为“最新一条消息之前”，保持普通用户轮行为不变。
-    fn context_insert_index_before_pending_block(messages: &[Message]) -> usize {
-        let Some(last_block) = message_blocks(messages).last().cloned() else {
-            return 0;
-        };
-        if last_block.len() > 1
-            && messages[last_block.start].role == "assistant"
-            && messages[last_block.start]
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty())
-        {
-            return last_block.start;
-        }
+    fn assemble_turn(&self, ctx: &TaskContext) -> Result<AssembledTurn> {
+        self.orchestrator.as_ref().map_or_else(
+            || Ok(AssembledTurn::default()),
+            |orchestrator| orchestrator.assemble(ctx),
+        )
+    }
 
-        messages.len().saturating_sub(1)
+    fn assemble_effective_request(
+        &self,
+        req: ChatRequest,
+        ctx: &TaskContext,
+        soft_landing: bool,
+        fatal_tools: &HashSet<String>,
+    ) -> Result<(ChatRequest, bool)> {
+        let assembled = self.assemble_turn(ctx)?;
+        let read_only = assembled.read_only;
+        let mut req = self.apply_assembled(req, &assembled);
+        if soft_landing {
+            req.tool_choice = Some("none".to_string());
+            req.messages.push(Message::system(
+                "已达到本轮工具调用上限。禁止继续调用工具；请仅使用已有结果给出简洁总结，明确说明尚未完成的步骤。",
+            ));
+        }
+        Self::remove_tools_from_request(&mut req, fatal_tools);
+        Ok((req, read_only))
+    }
+
+    async fn preflight_request(
+        &self,
+        current_ctx: &TaskContext,
+        pending_user_message: String,
+    ) -> Result<RequestPreflight> {
+        let (head_node_id, head_path) = {
+            let tree = self.tree.read().await;
+            (tree.head(), tree.path_to_head())
+        };
+        let assembled = self.assemble_turn(current_ctx)?;
+        let request = self
+            .snapshot_with_pending_user(pending_user_message, &assembled.context_messages)
+            .await;
+        let mut request = self.apply_assembled(request, &assembled);
+        Self::remove_tools_from_request(&mut request, &HashSet::new());
+        let baseline = self
+            .last_baseline
+            .as_ref()
+            .filter(|baseline| baseline.extends_request(&request, head_node_id, &head_path));
+        let estimate_source = if baseline.is_some() {
+            EstimateSource::Baseline
+        } else {
+            EstimateSource::Full
+        };
+        let estimated_input_tokens =
+            calibrated_request_tokens(&request, self.token_calibrator.factor(), baseline);
+        let (output_reserve_tokens, safety_reserve_tokens, input_budget_tokens, suggest_compaction) =
+            self.config.context_window_tokens.map_or(
+                (None, None, None, None),
+                |context_window_tokens| {
+                    let (output, safety, budget) =
+                        context_budget_breakdown(&request, context_window_tokens, estimate_source);
+                    (
+                        Some(output),
+                        Some(safety),
+                        Some(budget),
+                        Some(estimated_input_tokens >= budget),
+                    )
+                },
+            );
+
+        Ok(RequestPreflight {
+            estimated_input_tokens,
+            context_window_tokens: self.config.context_window_tokens,
+            output_reserve_tokens,
+            safety_reserve_tokens,
+            input_budget_tokens,
+            suggest_compaction,
+            head_node_id,
+            request_fingerprint: format!("{:016x}", request_fingerprint(&request)),
+            estimate_source: estimate_source.as_str().to_string(),
+        })
     }
 
     async fn apply_ctrl(
@@ -617,6 +735,12 @@ impl LLMSession {
                     .await?;
             }
             CtrlMsg::Continue { node_id } => return Ok(Some(node_id)),
+            CtrlMsg::Preflight { .. } => {
+                unreachable!("预检控制消息必须在等待输入循环中处理")
+            }
+            CtrlMsg::SubmitUserTurn { .. } => {
+                unreachable!("用户提交控制消息必须在等待输入循环中处理")
+            }
         }
         Ok(None)
     }
@@ -644,6 +768,7 @@ impl LLMSession {
                 force_wait_for_user = false;
                 tool_rounds = 0;
                 accumulated_usage = None;
+                self.usage_turn_id = 0;
                 continuation_of = None;
                 pending_continuation_context = None;
                 fatal_tools.clear();
@@ -659,12 +784,18 @@ impl LLMSession {
 
                     match future::select(input_fut, ctrl_fut).await {
                         Either::Left((Some(input), _)) => {
+                            if let Some(ref mut rx) = ctx_rx
+                                && rx.has_changed().unwrap_or(false)
+                            {
+                                current_ctx = rx.borrow_and_update().clone();
+                            }
                             log::info!(
                                 "[client:drive][input_received] next_turn_id={} input_chars={}",
                                 self.turn_id + 1,
                                 input.chars().count()
                             );
-                            self.add_message(Message::user(input)).await;
+                            self.usage_turn_id =
+                                self.capture_user_turn(input, &current_ctx).await?;
                             continuation_of = None;
                             pending_continuation_context = None;
                             log::info!(
@@ -675,6 +806,55 @@ impl LLMSession {
                         }
                         Either::Left((None, _)) => return Ok(()),
                         Either::Right((Some(ctrl), _)) => {
+                            let ctrl = match ctrl {
+                                CtrlMsg::Preflight {
+                                    pending_user_message,
+                                    response,
+                                } => {
+                                    if let Some(ref mut rx) = ctx_rx
+                                        && rx.has_changed().unwrap_or(false)
+                                    {
+                                        current_ctx = rx.borrow_and_update().clone();
+                                    }
+                                    let result = self
+                                        .preflight_request(&current_ctx, pending_user_message)
+                                        .await
+                                        .map_err(ClientError::from_anyhow_owned);
+                                    let _ = response.send(result);
+                                    continue 'wait;
+                                }
+                                CtrlMsg::SubmitUserTurn {
+                                    message,
+                                    context,
+                                    response,
+                                } => {
+                                    if let Some(context) = context {
+                                        current_ctx = context;
+                                    } else if let Some(ref mut rx) = ctx_rx
+                                        && rx.has_changed().unwrap_or(false)
+                                    {
+                                        current_ctx = rx.borrow_and_update().clone();
+                                    }
+                                    let result = self
+                                        .capture_user_turn(message, &current_ctx)
+                                        .await
+                                        .map_err(ClientError::from_anyhow_owned);
+                                    match result {
+                                        Ok(node_id) => {
+                                            self.usage_turn_id = node_id;
+                                            continuation_of = None;
+                                            pending_continuation_context = None;
+                                            let _ = response.send(Ok(node_id));
+                                            break 'wait;
+                                        }
+                                        Err(error) => {
+                                            let _ = response.send(Err(error));
+                                            continue 'wait;
+                                        }
+                                    }
+                                }
+                                ctrl => ctrl,
+                            };
                             if let Some(node_id) = self.apply_ctrl(ctrl, &event_tx).await? {
                                 continuation_of = Some(node_id);
                                 pending_continuation_context = Some(node_id);
@@ -698,6 +878,10 @@ impl LLMSession {
                         Either::Right((None, _)) => return Ok(()),
                     }
                 }
+            }
+
+            if self.usage_turn_id == 0 {
+                self.usage_turn_id = self.current_user_turn_node_id().await.unwrap_or(0);
             }
 
             // 每轮开始前尝试更新 context（非阻塞）。上下文只保留最新值，避免等待用户输入时积压。
@@ -786,22 +970,13 @@ impl LLMSession {
             // Orchestrator 装配（如果有）
             // Session 永远只读 AssembledTurn::read_only，不感知 TaskContext 业务字段。
             // 无编排器时使用 AssembledTurn::default()，read_only = false。
-            let (mut req, read_only) = if let Some(ref orch) = self.orchestrator {
-                let assembled = orch.assemble(&current_ctx)?;
-                let read_only = assembled.read_only;
-                let req = self.apply_assembled(req, &assembled);
-                (req, read_only)
-            } else {
-                (req, AssembledTurn::default().read_only)
-            };
             let soft_landing_this_round = std::mem::take(&mut tool_round_soft_landing);
-            if soft_landing_this_round {
-                req.tool_choice = Some("none".to_string());
-                req.messages.push(Message::system(
-                    "已达到本轮工具调用上限。禁止继续调用工具；请仅使用已有结果给出简洁总结，明确说明尚未完成的步骤。",
-                ));
-            }
-            Self::remove_tools_from_request(&mut req, &fatal_tools);
+            let (req, read_only) = self.assemble_effective_request(
+                req,
+                &current_ctx,
+                soft_landing_this_round,
+                &fatal_tools,
+            )?;
             let auto_confirm_writes = current_ctx
                 .flags
                 .get("auto_confirm_writes")
@@ -847,11 +1022,7 @@ impl LLMSession {
             // 累加本轮的 usage（同一用户 turn 内可能有多次 API 调用，如工具执行后的重试）
             if let Some(ref u) = usage {
                 match accumulated_usage {
-                    Some(ref mut acc) => {
-                        acc.prompt_tokens += u.prompt_tokens;
-                        acc.completion_tokens += u.completion_tokens;
-                        acc.total_tokens += u.total_tokens;
-                    }
+                    Some(ref mut acc) => acc.accumulate_request(u),
                     None => accumulated_usage = Some(u.clone()),
                 }
             }
@@ -977,13 +1148,109 @@ impl LLMSession {
             .is_some_and(|r| r == "user")
     }
 
+    async fn current_user_turn_node_id(&self) -> Option<u64> {
+        let tree = self.tree.read().await;
+        tree.path_to_head().into_iter().rev().find(|node_id| {
+            tree.get_node(*node_id)
+                .is_some_and(|node| node.message.role == "user")
+        })
+    }
+
+    async fn capture_user_turn(&self, input: String, ctx: &TaskContext) -> Result<u64> {
+        let assembled = self.assemble_turn(ctx)?;
+        let prepared = PreparedContextSnapshot::from_messages(&assembled.context_messages);
+        let mut tree = self.tree.write().await;
+        let path = tree.path_to_head();
+        let mut snapshots = self.context_snapshots.write().await;
+        let previous = Self::latest_context_snapshot_on_path(&path, &snapshots);
+        let should_record = previous
+            .map(|snapshot| !prepared.matches(snapshot))
+            .unwrap_or(!prepared.sources.is_empty());
+        let node_id = tree.append(Message::user(input), self.turn_id);
+        if should_record {
+            snapshots.push(prepared.bind(node_id));
+        }
+        Ok(node_id)
+    }
+
+    fn latest_context_snapshot_on_path<'a>(
+        path: &[u64],
+        snapshots: &'a [TurnContextSnapshot],
+    ) -> Option<&'a TurnContextSnapshot> {
+        path.iter().rev().find_map(|node_id| {
+            snapshots
+                .iter()
+                .rev()
+                .find(|snapshot| snapshot.owner_node_id == *node_id)
+        })
+    }
+
+    fn compile_tree_messages(
+        tree: &ConversationTree,
+        snapshots: &[TurnContextSnapshot],
+    ) -> Vec<Message> {
+        let mut messages = Vec::new();
+        for node in tree.linearize_nodes() {
+            let user_snapshot = snapshots.iter().find(|snapshot| {
+                snapshot.owner_node_id == node.id
+                    && snapshot.placement == ContextSnapshotPlacement::UserMessage
+            });
+            let message = match user_snapshot {
+                Some(snapshot) if node.message.role == "user" => {
+                    compile_user_message(node.message, snapshot)
+                }
+                _ => node.message,
+            };
+            messages.push(message);
+            if let Some(snapshot) = snapshots.iter().find(|snapshot| {
+                snapshot.owner_node_id == node.id
+                    && snapshot.placement == ContextSnapshotPlacement::AfterNode
+            }) {
+                messages.push(compile_reference_message(snapshot));
+            }
+        }
+        messages
+    }
+
+    async fn snapshot_with_pending_user(
+        &self,
+        pending_user_message: String,
+        context_messages: &[String],
+    ) -> ChatRequest {
+        let mut req = self.conversation.read().await.clone();
+        let tree = self.tree.read().await;
+        let snapshots = self.context_snapshots.read().await;
+        let mut messages = self.system_messages.iter().cloned().collect::<Vec<_>>();
+        messages.extend(Self::compile_tree_messages(&tree, &snapshots));
+
+        let prepared = PreparedContextSnapshot::from_messages(context_messages);
+        let previous = Self::latest_context_snapshot_on_path(&tree.path_to_head(), &snapshots);
+        let should_record = previous
+            .map(|snapshot| !prepared.matches(snapshot))
+            .unwrap_or(!prepared.sources.is_empty());
+        let pending = if should_record {
+            compile_user_message(Message::user(pending_user_message), &prepared.bind(0))
+        } else {
+            Message::user(pending_user_message)
+        };
+        messages.push(pending);
+        req.messages = Self::sanitize_messages(messages);
+        if self.strip_reasoning_content {
+            Self::strip_reasoning_content(&mut req.messages);
+        }
+        req.tools = self.tool_registry.schemas();
+        req
+    }
+
     async fn snapshot(&self) -> ChatRequest {
         let mut req = self.conversation.read().await.clone();
+        let tree = self.tree.read().await;
+        let snapshots = self.context_snapshots.read().await;
         let messages: Vec<Message> = self
             .system_messages
             .iter()
             .cloned()
-            .chain(self.tree.read().await.linearize())
+            .chain(Self::compile_tree_messages(&tree, &snapshots))
             .collect();
         req.messages = Self::sanitize_messages(messages);
         if self.strip_reasoning_content {

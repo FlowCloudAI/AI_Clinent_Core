@@ -1,6 +1,7 @@
 pub mod accumulator;
 pub mod config;
 mod context_budget;
+pub mod context_snapshot;
 pub mod handle;
 pub mod session;
 pub mod stream_decoder;

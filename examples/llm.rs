@@ -167,6 +167,22 @@ async fn run_chat_loop(
                 SYSTEM_COLOR, dropped_rounds, truncated_messages, before, after, COLOR_RESET
             ),
 
+            SessionEvent::RequestUsage {
+                request_id,
+                attempt,
+                usage,
+                ..
+            } => println!(
+                "\n{}[系统] 请求 {}.{} 用量：输入 {}、输出 {}、缓存命中 {:?} tokens{}",
+                SYSTEM_COLOR,
+                request_id,
+                attempt,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.cached_prompt_tokens,
+                COLOR_RESET
+            ),
+
             SessionEvent::TurnEnd { status, .. } => {
                 println!(
                     "\n{}--- TurnEnd: {:?} ---{}",

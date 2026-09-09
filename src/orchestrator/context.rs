@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// 再由 `Orchestrate::assemble` 消费转换为 `AssembledTurn`。
 ///
 /// # 字段分层约定
-/// - **中性扩展字段**（首选）：`attributes` / `flags` / `payload`
+/// - **中性扩展字段**（首选）：`attributes` / `instruction_attributes` / `flags` / `payload`
 ///   适合自定义 `Orchestrate` 实现；不与具体业务绑定。
 /// - **遗留字段**：`task_type` / `project_id` / `selection` / `entities` / `read_only`
 ///   由 `DefaultOrchestrator` 消费；自定义实现可忽略它们。
@@ -25,6 +25,12 @@ pub struct TaskContext {
     ///
     /// 示例：`{"scene": "editor", "language": "zh"}`
     pub attributes: HashMap<String, String>,
+
+    /// 需要保持 system 权限层级的动态指令。
+    ///
+    /// 与 `attributes` 的参考材料语义严格分开：这里的变化可以主动使请求前缀失效，
+    /// 不能用于词条、文档或其他不可信数据。
+    pub instruction_attributes: HashMap<String, String>,
 
     /// 任意布尔标志（推荐用于自定义 Orchestrate 实现）。
     ///
@@ -86,16 +92,16 @@ impl TaskContext {
 /// `Orchestrate` 实现是最终裁决层，此结构中的值优先级高于 Sense 默认值。
 #[derive(Clone, Debug, Default)]
 pub struct AssembledTurn {
-    /// 额外注入的 system messages。
+    /// 需要随所属用户回合冻结的参考材料。
     ///
-    /// 插入位置语义由 Session 固定定义为：
-    /// - 优先插在“最后一个待续会话块”之前；
-    /// - 若不存在待续会话块，则退化为插在最新用户消息之前。
-    ///
-    /// 其中“待续会话块”当前指请求尾部的
-    /// `assistant(tool_calls) + tool...` 连续片段，
-    /// 用于保证工具续轮时不破坏模型要求的相邻顺序。
+    /// Session 在用户提交时把这些正文记录为 `TurnContextSnapshot`，发送时与所属
+    /// user 消息固定组合。它们不会作为 system 消息注入。
     pub context_messages: Vec<String>,
+
+    /// 每次实际请求都重新装配的 system 指令。
+    ///
+    /// 只用于可信策略、对话级指令和权限提示；参考材料不得放入这里。
+    pub instruction_messages: Vec<String>,
 
     /// 本轮工具配置，三种语义严格区分：
     ///

@@ -1,6 +1,6 @@
 # core_ai_client 文档索引
 
-> 更新日期：2026-08-19
+> 更新日期：2026-09-09
 
 ## 状态含义
 
@@ -15,7 +15,7 @@
 | 文档 | 状态 | 日期 | 说明 |
 | --- | --- | --- | --- |
 | [client_error.md](client_error.md) | 现行 | 2026-05-24 | `ClientError` 错误码索引，含载体类型、序列化方式与 anyhow 互转规则。**行号引用基准为 commit `13a2165`，大改后需重新核对**。修改错误码或迁移构造位置时同步更新本文件 |
-| [orchestrator.md](orchestrator.md) | 待复核 | 2026-04-25 | 装配层（Orchestrator）设计与用法，自述「描述当前实现，可直接对照源码阅读」。含 4 处未完成标记 |
+| [orchestrator.md](orchestrator.md) | 现行 | 2026-09-09 | 装配层与 Session 对接：冻结引用、实时可信指令、原子提交、请求预检及上下文快照持久化契约 |
 | [API_QUICK_REFERENCE.md](API_QUICK_REFERENCE.md) | 待复核 | 2026-04-25 | 插件管理 API 快速参考：`list_all_plugins` 等核心方法签名 |
 | [PLUGIN_MANAGEMENT_IMPLEMENTATION.md](PLUGIN_MANAGEMENT_IMPLEMENTATION.md) | 归档 | 2026-04-25 | `FlowCloudAIClient` 插件生命周期管理的实现总结（元数据查询、动态安装、安全卸载） |
 

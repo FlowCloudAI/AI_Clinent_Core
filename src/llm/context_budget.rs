@@ -105,6 +105,21 @@ pub(crate) fn context_budget(
     scale: f64,
     estimate_source: EstimateSource,
 ) -> u64 {
+    let (_, _, available) =
+        context_budget_breakdown(request, context_window_tokens, estimate_source);
+    let normalized_scale = if scale.is_finite() {
+        scale.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    (available as f64 * normalized_scale).floor() as u64
+}
+
+pub(crate) fn context_budget_breakdown(
+    request: &ChatRequest,
+    context_window_tokens: u64,
+    estimate_source: EstimateSource,
+) -> (u64, u64, u64) {
     let output_reserve = request
         .max_tokens
         .filter(|tokens| *tokens > 0)
@@ -122,20 +137,16 @@ pub(crate) fn context_budget(
     let available = context_window_tokens
         .saturating_sub(output_reserve)
         .saturating_sub(safety_reserve);
-    let normalized_scale = if scale.is_finite() {
-        scale.clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
-    (available as f64 * normalized_scale).floor() as u64
+    (output_reserve, safety_reserve, available)
 }
 
-pub(crate) fn trim_request_for_window(
+pub(crate) fn trim_request_for_window_preserving_context(
     request: &mut ChatRequest,
     context_window_tokens: u64,
     calibration_factor: f64,
     baseline: Option<&RequestBaseline>,
     options: TrimOptions,
+    required_user_context: Option<&str>,
 ) -> Result<Option<ContextTrimReport>, ClientError> {
     let estimate_source = estimate_source(baseline);
     let budget = context_budget(
@@ -144,12 +155,13 @@ pub(crate) fn trim_request_for_window(
         options.budget_scale,
         estimate_source,
     );
-    trim_request_to_budget_with_baseline(
+    trim_request_to_budget_with_baseline_preserving_context(
         request,
         budget,
         calibration_factor,
         options.force_drop_oldest_round,
         baseline,
+        required_user_context,
     )
 }
 
@@ -169,12 +181,31 @@ pub(crate) fn trim_request_to_budget(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn trim_request_to_budget_with_baseline(
     request: &mut ChatRequest,
     budget: u64,
     calibration_factor: f64,
     force_drop_oldest_round: bool,
     baseline: Option<&RequestBaseline>,
+) -> Result<Option<ContextTrimReport>, ClientError> {
+    trim_request_to_budget_with_baseline_preserving_context(
+        request,
+        budget,
+        calibration_factor,
+        force_drop_oldest_round,
+        baseline,
+        None,
+    )
+}
+
+pub(crate) fn trim_request_to_budget_with_baseline_preserving_context(
+    request: &mut ChatRequest,
+    budget: u64,
+    calibration_factor: f64,
+    force_drop_oldest_round: bool,
+    baseline: Option<&RequestBaseline>,
+    required_user_context: Option<&str>,
 ) -> Result<Option<ContextTrimReport>, ClientError> {
     let estimate_source = estimate_source(baseline);
     let before = calibrated_request_tokens(request, calibration_factor, baseline);
@@ -192,7 +223,8 @@ pub(crate) fn trim_request_to_budget_with_baseline(
 
     if actual > budget {
         loop {
-            let mut candidates = truncation_candidates(&candidate.messages, last_user);
+            let mut candidates =
+                truncation_candidates(&candidate.messages, last_user, required_user_context);
             candidates.sort_by_key(|(priority, chars, index, field)| {
                 (*priority, std::cmp::Reverse(*chars), *index, *field)
             });
@@ -261,6 +293,7 @@ pub(crate) fn trim_request_to_budget_with_baseline(
 
     let mut dropped_rounds = 0;
     let mut must_force_drop = force_drop_oldest_round;
+    let mut carried_context = false;
     loop {
         let rounds = conversation_rounds(&candidate.messages);
         let keep = if force_drop_oldest_round {
@@ -281,6 +314,9 @@ pub(crate) fn trim_request_to_budget_with_baseline(
             .collect();
         dropped_rounds += 1;
         must_force_drop = false;
+        if let Some(required) = required_user_context {
+            carried_context |= ensure_required_user_context(&mut candidate.messages, required);
+        }
         actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
@@ -298,7 +334,7 @@ pub(crate) fn trim_request_to_budget_with_baseline(
         actual = calibrated_request_tokens(&candidate, calibration_factor, baseline);
     }
 
-    let changed = !truncated_indices.is_empty() || dropped_rounds > 0;
+    let changed = !truncated_indices.is_empty() || dropped_rounds > 0 || carried_context;
     if actual > budget || (force_drop_oldest_round && !changed) {
         return Err(context_budget_error_with_baseline(
             &candidate,
@@ -385,6 +421,7 @@ fn percent_ceil(value: u64, percent: u64) -> u64 {
 fn truncation_candidates(
     messages: &[Message],
     last_user: Option<usize>,
+    required_user_context: Option<&str>,
 ) -> Vec<(usize, usize, usize, TextField)> {
     let mut candidates = Vec::new();
     for (index, message) in messages.iter().enumerate() {
@@ -397,6 +434,11 @@ fn truncation_candidates(
             (TextField::Reasoning, message.reasoning_content.as_deref()),
         ] {
             let Some(text) = text else { continue };
+            if field == TextField::Content
+                && required_user_context.is_some_and(|required| text.starts_with(required))
+            {
+                continue;
+            }
             let chars = visible_text_chars(text);
             if chars.saturating_sub(MIN_KEEP_CHARS) >= MIN_TRUNCATE_CHARS {
                 candidates.push((priority, chars, index, field));
@@ -404,6 +446,26 @@ fn truncation_candidates(
         }
     }
     candidates
+}
+
+/// 历史裁剪删掉快照所属回合后，把该分支仍有效的参考材料绑定到最新用户消息。
+/// 最新用户消息本就是预算保护对象，因此补回的材料会参与最终预算且不会再次被静默删除。
+fn ensure_required_user_context(messages: &mut [Message], required: &str) -> bool {
+    if messages.iter().any(|message| {
+        message.role == "user"
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.starts_with(required))
+    }) {
+        return false;
+    }
+    let Some(last_user) = messages.iter_mut().rfind(|message| message.role == "user") else {
+        return false;
+    };
+    let user_content = last_user.content.take().unwrap_or_default();
+    last_user.content = Some(format!("{required}\n\n[用户请求]\n{user_content}"));
+    true
 }
 
 fn truncation_target_chars(text: &str, excess_tokens: u64, calibration_factor: f64) -> usize {
@@ -613,6 +675,51 @@ mod tests {
             })
             .collect();
         assert_eq!(kept, (kept[0]..=6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn 删除快照所属回合时把有效参考材料携带到最新用户消息() {
+        let reference = "[当前回合参考材料快照 v1]\n[来源：entry]\n仍然有效的固定资料";
+        let mut req = request(vec![
+            Message::user(format!("{reference}\n\n[用户请求]\n第一问")),
+            Message::assistant(Some("第一答"), None::<String>, None),
+            Message::user("第二问"),
+            Message::assistant(Some("第二答"), None::<String>, None),
+            Message::user("第三问"),
+            Message::assistant(Some("第三答"), None::<String>, None),
+            Message::user("第四问"),
+        ]);
+
+        let report = trim_request_to_budget_with_baseline_preserving_context(
+            &mut req,
+            100_000,
+            1.0,
+            true,
+            None,
+            Some(reference),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.dropped_rounds, 1);
+        assert!(req.messages.iter().all(|message| {
+            !message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("第一问"))
+        }));
+        let current = req.messages.last().unwrap().content.as_deref().unwrap();
+        assert!(current.starts_with(reference));
+        assert!(current.ends_with("[用户请求]\n第四问"));
+        assert_eq!(
+            req.messages
+                .iter()
+                .filter_map(|message| message.content.as_deref())
+                .filter(|content| content.starts_with(reference))
+                .count(),
+            1
+        );
+        assert!(calibrated_request_tokens(&req, 1.0, None) <= report.budget);
     }
 
     #[test]

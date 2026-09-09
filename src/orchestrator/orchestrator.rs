@@ -61,9 +61,9 @@ impl DefaultOrchestrator {
     // ── 内部步骤 ──
 
     fn inject_context(&self, ctx: &TaskContext, turn: &mut AssembledTurn) {
-        // 遗留字段注入
+        // task_type 是可信运行策略，每次请求重装配；选区、实体和 attributes 是参考资料。
         if !ctx.task_type.is_empty() {
-            turn.context_messages
+            turn.instruction_messages
                 .push(format!("[Task type: {}]", ctx.task_type));
         }
         if let Some(ref sel) = ctx.selection {
@@ -76,8 +76,18 @@ impl DefaultOrchestrator {
         }
 
         // 中性 attributes 注入
-        for (k, v) in &ctx.attributes {
-            turn.context_messages.push(format!("[{}]\n{}", k, v));
+        let mut attributes = ctx.attributes.iter().collect::<Vec<_>>();
+        attributes.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, value) in attributes {
+            turn.context_messages.push(format!("[{}]\n{}", key, value));
+        }
+
+        // 指令与参考材料分层；变化会使 system 前缀失效，但不会写入历史快照。
+        let mut instructions = ctx.instruction_attributes.iter().collect::<Vec<_>>();
+        instructions.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        for (key, value) in instructions {
+            turn.instruction_messages
+                .push(format!("[{}]\n{}", key, value));
         }
     }
 
@@ -189,5 +199,52 @@ mod tests {
 
         assert_eq!(turn.enabled_tools, vec!["alpha".to_string()]);
         assert_eq!(turn.tool_schemas.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn attributes_插入顺序不同仍产生相同上下文() {
+        let orch = DefaultOrchestrator::new(registry_with_tools());
+        let mut left = TaskContext::default();
+        left.attributes.insert("zeta".to_string(), "3".to_string());
+        left.attributes.insert("alpha".to_string(), "1".to_string());
+        left.attributes
+            .insert("middle".to_string(), "2".to_string());
+        let mut right = TaskContext::default();
+        right
+            .attributes
+            .insert("middle".to_string(), "2".to_string());
+        right.attributes.insert("zeta".to_string(), "3".to_string());
+        right
+            .attributes
+            .insert("alpha".to_string(), "1".to_string());
+
+        assert_eq!(
+            orch.assemble(&left).unwrap().context_messages,
+            orch.assemble(&right).unwrap().context_messages
+        );
+    }
+
+    #[test]
+    fn 指令字段与参考材料保持分层且顺序确定() {
+        let orch = DefaultOrchestrator::new(registry_with_tools());
+        let mut ctx = TaskContext::default();
+        ctx.attributes
+            .insert("entry".to_string(), "参考正文".to_string());
+        ctx.task_type = "proofreading".to_string();
+        ctx.instruction_attributes
+            .insert("z_policy".to_string(), "后置策略".to_string());
+        ctx.instruction_attributes
+            .insert("a_policy".to_string(), "前置策略".to_string());
+
+        let turn = orch.assemble(&ctx).unwrap();
+        assert_eq!(turn.context_messages, vec!["[entry]\n参考正文"]);
+        assert_eq!(
+            turn.instruction_messages,
+            vec![
+                "[Task type: proofreading]",
+                "[a_policy]\n前置策略",
+                "[z_policy]\n后置策略"
+            ]
+        );
     }
 }
