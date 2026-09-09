@@ -592,21 +592,24 @@ impl LLMSession {
             };
             let line = match raw_line {
                 Ok(line) => line,
-                Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                Err(error) => {
+                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
+                    if full_content.is_empty() && full_reasoning.is_empty() && usage.is_none() {
+                        return Err(error);
+                    }
                     let error = ClientError::from_anyhow_owned(error);
                     log::warn!(
-                        "[client:llm][stream_read_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                        "[client:llm][stream_read_interrupted] turn_id={} content_chars={} reasoning_chars={} has_usage={} error={}",
                         self.turn_id,
                         full_content.chars().count(),
                         full_reasoning.chars().count(),
+                        usage.is_some(),
                         error
                     );
                     turn_status = TurnStatus::Error(error);
                     finish_reason = Some("interrupted".to_string());
-                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
                     break 'outer;
                 }
-                Err(error) => return Err(error),
             };
             if cancel.is_cancelled() {
                 turn_status = TurnStatus::Cancelled;
@@ -630,21 +633,24 @@ impl LLMSession {
             // acquire → map → release，每行独立借出，不跨 await
             let normalized = match self.normalize_stream_line(&line) {
                 Ok(normalized) => normalized,
-                Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                Err(error) => {
+                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
+                    if full_content.is_empty() && full_reasoning.is_empty() && usage.is_none() {
+                        return Err(error);
+                    }
                     let error = ClientError::from_anyhow_owned(error);
                     log::warn!(
-                        "[client:llm][stream_map_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                        "[client:llm][stream_map_interrupted] turn_id={} content_chars={} reasoning_chars={} has_usage={} error={}",
                         self.turn_id,
                         full_content.chars().count(),
                         full_reasoning.chars().count(),
+                        usage.is_some(),
                         error
                     );
                     turn_status = TurnStatus::Error(error);
                     finish_reason = Some("interrupted".to_string());
-                    merge_stream_usage(&mut usage, decoder.take_pending_usage());
                     break 'outer;
                 }
-                Err(error) => return Err(error),
             };
 
             let events = decoder.decode(&normalized);
@@ -652,21 +658,24 @@ impl LLMSession {
             for ev in events {
                 let ev = match ev {
                     Ok(event) => event,
-                    Err(error) if !full_content.is_empty() || !full_reasoning.is_empty() => {
+                    Err(error) => {
+                        merge_stream_usage(&mut usage, decoder.take_pending_usage());
+                        if full_content.is_empty() && full_reasoning.is_empty() && usage.is_none() {
+                            return Err(error);
+                        }
                         let error = ClientError::from_anyhow_owned(error);
                         log::warn!(
-                            "[client:llm][stream_decode_interrupted] turn_id={} content_chars={} reasoning_chars={} error={}",
+                            "[client:llm][stream_decode_interrupted] turn_id={} content_chars={} reasoning_chars={} has_usage={} error={}",
                             self.turn_id,
                             full_content.chars().count(),
                             full_reasoning.chars().count(),
+                            usage.is_some(),
                             error
                         );
                         turn_status = TurnStatus::Error(error);
                         finish_reason = Some("interrupted".to_string());
-                        merge_stream_usage(&mut usage, decoder.take_pending_usage());
                         break 'outer;
                     }
-                    Err(error) => return Err(error),
                 };
 
                 match ev.payload {
@@ -802,6 +811,10 @@ impl LLMSession {
         }
 
         merge_stream_usage(&mut usage, decoder.take_pending_usage());
+        if matches!(turn_status, TurnStatus::Error(_)) {
+            // 流协议已损坏时，即使工具参数看似完整也不能执行；用量与生成状态独立保留。
+            tool_calls.clear();
+        }
         if finish_reason.is_none() {
             // 部分 API（如 DeepSeek v4 代理）不在流式 chunk 中携带
             // finish_reason，而是仅以 [DONE] 或 TCP 关闭表示结束。

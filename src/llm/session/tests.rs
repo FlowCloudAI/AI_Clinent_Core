@@ -188,6 +188,10 @@ enum MockReply {
         name: String,
         usage: serde_json::Value,
     },
+    StreamToolCallUsageThenMalformed {
+        name: String,
+        usage: serde_json::Value,
+    },
 }
 
 async fn spawn_mock_server(replies: Vec<MockReply>) -> (String, Arc<AtomicUsize>) {
@@ -309,6 +313,14 @@ async fn handle_mock_connection(mut socket: TcpStream, reply: MockReply) {
             let _ = write_sse_line(&mut socket, stream_tool_finish_chunk()).await;
             let _ = write_sse_line(&mut socket, stream_usage_chunk(usage)).await;
             let _ = write_sse_line(&mut socket, "[DONE]".to_string()).await;
+            let _ = socket.flush().await;
+        }
+        MockReply::StreamToolCallUsageThenMalformed { name, usage } => {
+            let _ = write_stream_headers(&mut socket).await;
+            let _ = write_sse_line(&mut socket, stream_tool_call_chunk(&name)).await;
+            let _ = write_sse_line(&mut socket, stream_tool_finish_chunk()).await;
+            let _ = write_sse_line(&mut socket, stream_usage_chunk(usage)).await;
+            let _ = write_sse_line(&mut socket, "{malformed".to_string()).await;
             let _ = socket.flush().await;
         }
     }
@@ -662,6 +674,67 @@ async fn 工具结束后的用量尾包逐条发出且回合汇总不重复() {
     assert_eq!(turn_usage.cached_prompt_tokens, Some(19));
     assert_eq!(turn_usage.request_count, 2);
     assert_eq!(turn_usage.cache_usage_known_requests, 2);
+    drop(input_tx);
+}
+
+#[tokio::test]
+async fn 工具流异常尾包不丢弃已收到的用量且不执行工具() {
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let registry =
+        registry_with_failure("danger_tool", Arc::clone(&tool_calls), ToolFailure::Fatal);
+    let (url, request_count) =
+        spawn_mock_server(vec![MockReply::StreamToolCallUsageThenMalformed {
+            name: "danger_tool".to_string(),
+            usage: serde_json::json!({
+                "prompt_tokens": 60,
+                "completion_tokens": 50,
+                "total_tokens": 110,
+                "prompt_tokens_details": {"cached_tokens": 50}
+            }),
+        }])
+        .await;
+    let session = new_http_test_session(url, true, Arc::new(registry)).await;
+    let (input_tx, input_rx) = mpsc::channel(1);
+    let (mut events, handle) = session.try_run(input_rx).unwrap();
+    input_tx
+        .send("只计量，不执行损坏响应中的工具".to_string())
+        .await
+        .unwrap();
+
+    let mut request_usage = None;
+    let (turn_status, turn_usage, node_id) = loop {
+        match events.next().await {
+            Some(SessionEvent::RequestUsage { usage, .. }) => request_usage = Some(usage),
+            Some(SessionEvent::TurnEnd {
+                status,
+                usage,
+                node_id,
+                ..
+            }) => break (status, usage, node_id),
+            Some(SessionEvent::Error(error)) => panic!("收到错误事件且用量未落账: {error}"),
+            Some(_) => {}
+            None => panic!("事件流提前结束"),
+        }
+    };
+
+    let request_usage = request_usage.expect("应发出请求级用量事件");
+    assert_eq!(request_usage.total_tokens, 110);
+    assert_eq!(request_usage.cached_prompt_tokens, Some(50));
+    let turn_usage = turn_usage.expect("异常回合也应保留已收到的用量");
+    assert_eq!(turn_usage.total_tokens, 110);
+    assert_eq!(turn_usage.cached_prompt_tokens, Some(50));
+    assert!(matches!(turn_status, TurnStatus::Error(_)));
+    assert_eq!(node_id, None);
+    assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(request_count.load(Ordering::SeqCst), 1);
+    assert!(
+        handle
+            .get_conversation()
+            .await
+            .messages
+            .iter()
+            .all(|message| message.role != "assistant")
+    );
     drop(input_tx);
 }
 
@@ -1484,7 +1557,7 @@ async fn 实际发送裁剪早期回合后仍携带当前有效快照() {
     .await;
     let registry = Arc::new(ToolRegistry::new());
     let mut session = new_http_test_session(url, true, Arc::clone(&registry)).await;
-    session.config.context_window_tokens = Some(3_500);
+    session.config.context_window_tokens = Some(3_100);
     session.with_orchestrator(DefaultOrchestrator::new(registry));
     let mut context = TaskContext::default();
     context.attributes.insert(

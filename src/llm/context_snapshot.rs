@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub(crate) const CONTEXT_SNAPSHOT_ASSEMBLY_VERSION: u32 = 1;
+pub(crate) const USER_REQUEST_SEPARATOR: &str = "\n\n[用户请求]\n";
 
 /// 快照中的单个有序来源。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,7 +112,7 @@ pub(crate) fn compile_user_message(
     debug_assert_eq!(message.role, "user");
     let user_content = message.content.take().unwrap_or_default();
     let reference = render_reference(snapshot);
-    message.content = Some(format!("{reference}\n\n[用户请求]\n{user_content}"));
+    message.content = Some(format!("{reference}{USER_REQUEST_SEPARATOR}{user_content}"));
     message
 }
 

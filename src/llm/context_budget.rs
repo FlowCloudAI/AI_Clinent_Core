@@ -4,6 +4,7 @@
 //! 系统消息、最新用户消息和工具调用参数始终保持原样，语义压缩由上层另行负责。
 
 use crate::error::{ClientError, ErrorCode};
+use crate::llm::context_snapshot::USER_REQUEST_SEPARATOR;
 use crate::llm::token_estimate::{
     RequestBaseline, estimate_messages_tokens, estimate_request_tokens, estimate_text_tokens,
     estimate_with_factor,
@@ -241,12 +242,16 @@ pub(crate) fn trim_request_to_budget_with_baseline_preserving_context(
                 let Some(text) = original.as_deref() else {
                     continue;
                 };
-                let target_chars = truncation_target_chars(
+                let Some(truncated) = truncate_text_for_budget(
                     text,
                     actual.saturating_sub(budget),
                     calibration_factor,
-                );
-                let Some(truncated) = truncate_text_to(text, target_chars) else {
+                    if field == TextField::Content {
+                        required_user_context
+                    } else {
+                        None
+                    },
+                ) else {
                     continue;
                 };
 
@@ -434,12 +439,17 @@ fn truncation_candidates(
             (TextField::Reasoning, message.reasoning_content.as_deref()),
         ] {
             let Some(text) = text else { continue };
-            if field == TextField::Content
-                && required_user_context.is_some_and(|required| text.starts_with(required))
+            let chars = if field == TextField::Content
+                && let Some(required) = required_user_context
+                && text.starts_with(required)
             {
-                continue;
-            }
-            let chars = visible_text_chars(text);
+                let Some(user_body) = protected_user_body(text, required) else {
+                    continue;
+                };
+                visible_text_chars(user_body)
+            } else {
+                visible_text_chars(text)
+            };
             if chars.saturating_sub(MIN_KEEP_CHARS) >= MIN_TRUNCATE_CHARS {
                 candidates.push((priority, chars, index, field));
             }
@@ -464,8 +474,33 @@ fn ensure_required_user_context(messages: &mut [Message], required: &str) -> boo
         return false;
     };
     let user_content = last_user.content.take().unwrap_or_default();
-    last_user.content = Some(format!("{required}\n\n[用户请求]\n{user_content}"));
+    last_user.content = Some(format!("{required}{USER_REQUEST_SEPARATOR}{user_content}"));
     true
+}
+
+fn protected_user_body<'a>(text: &'a str, required: &str) -> Option<&'a str> {
+    text.strip_prefix(required)?
+        .strip_prefix(USER_REQUEST_SEPARATOR)
+}
+
+/// 有效参考材料是不可裁剪前缀；只有其后的历史用户正文参与截断计算。
+fn truncate_text_for_budget(
+    text: &str,
+    excess_tokens: u64,
+    calibration_factor: f64,
+    required_user_context: Option<&str>,
+) -> Option<String> {
+    if let Some(required) = required_user_context
+        && text.starts_with(required)
+    {
+        let user_body = protected_user_body(text, required)?;
+        let target_chars = truncation_target_chars(user_body, excess_tokens, calibration_factor);
+        return truncate_text_to(user_body, target_chars)
+            .map(|body| format!("{required}{USER_REQUEST_SEPARATOR}{body}"));
+    }
+
+    let target_chars = truncation_target_chars(text, excess_tokens, calibration_factor);
+    truncate_text_to(text, target_chars)
 }
 
 fn truncation_target_chars(text: &str, excess_tokens: u64, calibration_factor: f64) -> usize {
@@ -719,6 +754,44 @@ mod tests {
                 .count(),
             1
         );
+        assert!(calibrated_request_tokens(&req, 1.0, None) <= report.budget);
+    }
+
+    #[test]
+    fn 快照消息只保护参考材料而允许裁剪历史问题() {
+        let reference = "[当前回合参考材料快照 v1]\n[来源：entry]\n必须完整保留的固定资料";
+        let long_question = format!("历史问题-{}", "问".repeat(4_000));
+        let mut req = request(vec![
+            Message::user(format!("{reference}\n\n[用户请求]\n{long_question}")),
+            Message::assistant(Some("第一答"), None::<String>, None),
+            Message::user("第二问"),
+            Message::assistant(Some("第二答"), None::<String>, None),
+            Message::user("第三问"),
+        ]);
+        let before = calibrated_request_tokens(&req, 1.0, None);
+
+        let report = trim_request_to_budget_with_baseline_preserving_context(
+            &mut req,
+            before.saturating_sub(500),
+            1.0,
+            false,
+            None,
+            Some(reference),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.dropped_rounds, 0);
+        assert_eq!(report.truncated_messages, 1);
+        let first_user = req
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .and_then(|message| message.content.as_deref())
+            .unwrap();
+        assert!(first_user.starts_with(reference));
+        assert!(first_user.contains("\n\n[用户请求]\n历史问题-"));
+        assert!(first_user.contains(TRUNCATED_MARKER_PREFIX));
         assert!(calibrated_request_tokens(&req, 1.0, None) <= report.budget);
     }
 
